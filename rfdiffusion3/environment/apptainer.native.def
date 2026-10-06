@@ -89,7 +89,9 @@ grep -v -E '^(#|apex==|rc-foundry==)' /tmp/requirements.lock > /tmp/stack.txt \
         libcublas-dev-13-0 libcurand-dev-13-0 libcusparse-dev-13-0 libcusolver-dev-13-0 \
    && rm -rf /var/lib/apt/lists/* /tmp/src /tmp/buildtools /tmp/apex.tar.gz || exit 1; \
     elif [ "$WHEELS_FROM" = prebuilt ]; then echo "$APEX_SHA256  /tmp/stock/wheels/$APEX_WHEEL" | sha256sum -c - || exit 1; \
-    else echo "WHEELS_FROM=$WHEELS_FROM: build or prebuilt" >&2; exit 2; fi \
+    elif [ "$WHEELS_FROM" = local ]; then [ -f "/tmp/stock/wheels/$APEX_WHEEL" ] || { echo "WHEELS_FROM=local: /tmp/stock/wheels/$APEX_WHEEL missing (tools/rfd3_apex/README.md)" >&2; exit 1; }; \
+      echo "apex wheel compiled locally by tools/rfd3_apex (not the published file): $(sha256sum "/tmp/stock/wheels/$APEX_WHEEL")"; \
+    else echo "WHEELS_FROM=$WHEELS_FROM: build, prebuilt or local" >&2; exit 2; fi \
  && for venv in /opt/stock /opt/kit; do \
       "$venv/bin/python" -m pip install --no-cache-dir --no-deps "/tmp/stock/wheels/$APEX_WHEEL" \
    && "$venv/bin/python" -c "import rfd3, apex, importlib; importlib.import_module('apex.normalization.fused_layer_norm'); import fused_layer_norm_cuda" \

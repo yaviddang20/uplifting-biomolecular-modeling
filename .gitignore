@@ -1,0 +1,7 @@
+# build products of the Apptainer route (tools/build_sif.sh)
+*.sif
+build_*.log
+build_status*.txt
+_jitcache/
+._*
+rfdiffusion3/stock/wheels/*.whl
