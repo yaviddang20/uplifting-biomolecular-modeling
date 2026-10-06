@@ -332,16 +332,16 @@ def prepare(score_model, feats, diffusion_conditioning, multiplicity):
     z = diffusion_conditioning["token_trans_bias"]                       # [B, N, N, L*H]
     mask = feats["token_pad_mask"]                                       # [B, N]
     B, N = int(z.shape[0]), int(z.shape[1])
-    if B != 1:
-        st.pack = None; return                                           # forward() falls back by name (bias_batch)
     dt = torch.bfloat16 if _CFG["attn"] == "bf16" else torch.float32
-    with torch.no_grad():
-        zv = z.view(B, N, N, st.L, st.H).permute(3, 0, 4, 1, 2)[:, 0]     # [L, H, N, N] view
-        mterm = (1 - mask[0].float())[None, None, :] * -st.inf            # [1, 1, N]: stock's key-mask term
-        pb = torch.empty((st.L, st.H, N, N), dtype=dt, device=z.device)
-        for l in range(st.L):                                            # layer by layer: the same elementwise fp32 add + cast per element (same bytes as the whole-tensor
-            pb[l] = (zv[l].to(dtype=torch.float32) + mterm).to(dt)       # form), with a [H, N, N] fp32 transient instead of an [L, H, N, N] one (2.2 GiB at 1200 tokens)
-    st.pack = {"pb": pb, "N": N, "z_ptr": z.data_ptr(), "multiplicity": int(multiplicity)}
+    with torch.no_grad():                                                # batched inference (B > 1 records, padded): one pack per record, each with ITS key mask folded in;
+        zv = z.view(B, N, N, st.L, st.H).permute(0, 3, 4, 1, 2)           # [B, L, H, N, N] view      pb[b] is the [L, H, N, N] block the kernel reads for record b's rows
+        pb = torch.empty((B, st.L, st.H, N, N), dtype=dt, device=z.device)
+        for b in range(B):
+            mterm = (1 - mask[b].float())[None, None, :] * -st.inf        # [1, 1, N]: stock's key-mask term
+            for l in range(st.L):                                        # layer by layer: the same elementwise fp32 add + cast per element (same bytes as the whole-tensor
+                pb[b, l] = (zv[b, l].to(dtype=torch.float32) + mterm).to(dt)   # form), with a [H, N, N] fp32 transient instead of an [L, H, N, N] one (2.2 GiB at 1200 tokens)
+    st.pack = {"pb": pb, "N": N, "B": B, "z_ptr": z.data_ptr(), "multiplicity": int(multiplicity)}
+    STATS["bias_batch"] = max(int(STATS.get("bias_batch") or 1), B)
     STATS["packs"] += 1; STATS["pack_gib"] = round(pb.numel() * pb.element_size() / 2 ** 30, 3)
     _log(f"packed pair bias [L={st.L},H={st.H},N={N}] {dt} ({STATS['pack_gib']} GiB)")
 
@@ -379,8 +379,9 @@ def fused_forward(tt, a, s, bias=None, mask=None, to_keys=None, multiplicity=1):
         return _scope("not_token_attention", tt, (a, s), dict(bias=bias, mask=mask, to_keys=to_keys, multiplicity=multiplicity))
     st = _STATE["st"] if _STATE["tt"] is tt else None
     Bm, N, D = a.shape
-    if st is None or st.pack is None or st.pack["N"] != N or D != st.D:
+    if st is None or st.pack is None or st.pack["N"] != N or D != st.D or Bm % st.pack["B"] != 0:
         return _scope("no_pack", tt, (a, s), dict(bias=bias, mask=mask, to_keys=to_keys, multiplicity=multiplicity))
+    NB = st.pack["B"]; mB = Bm // NB; RB = mB * N                        # records in the batch, samples per record in this call (rows are record-major: repeat_interleave), rows per record
     gp, ap = _CFG["gemm"], _CFG["attn"]
     gin = torch.bfloat16 if gp == "bf16" else torch.float32
     M = Bm * N
@@ -405,8 +406,10 @@ def fused_forward(tt, a, s, bias=None, mask=None, to_keys=None, multiplicity=1):
         c0 = l * 4 * D; g0 = l * 2 * D
         qkvg = _mm(xin, st.w_qkvg[l], gp, out_dtype=gin)                # [M, 4D]
         ctx = torch.empty(M, D, device=x.device, dtype=gin)
-        _flash_bias_kernel[(triton.cdiv(N, BQ), st.H, Bm)](qkvg, st.bq[l], pb[l], ctx, N, qkvg.stride(0), pb.stride(1), pb.stride(2), ctx.stride(0), float(st.scale),
-                                                              H=st.H, HD=st.HD, D=D, PREC=PREC, OUT_BF16=(gin == torch.bfloat16), BQ=BQ, BKV=BKV, num_warps=nw, num_stages=ns)
+        for b in range(NB):                                              # one launch per record: the kernel reads ONE [H, N, N] bias for the mB sample blocks of its grid (B = 1: the launch as before)
+            _flash_bias_kernel[(triton.cdiv(N, BQ), st.H, mB)](qkvg[b * RB:(b + 1) * RB], st.bq[l], pb[b, l], ctx[b * RB:(b + 1) * RB], N, qkvg.stride(0), pb.stride(2), pb.stride(3),
+                                                                  ctx.stride(0), float(st.scale), H=st.H, HD=st.HD, D=D, PREC=PREC, OUT_BF16=(gin == torch.bfloat16), BQ=BQ, BKV=BKV,
+                                                                  num_warps=nw, num_stages=ns)
         o = _mm(ctx, st.w_o[l], gp, out_dtype=torch.float32)            # [M, D] fp32
         x_new = torch.empty_like(x); xin = torch.empty(M, D, device=x.device, dtype=gin)
         _gate_res_adaln_kernel[(M,)](x, o, og[:, g0:g0 + D], st.bog_a[l], x_new, cs[:, c0 + 2 * D:c0 + 3 * D], cs[:, c0 + 3 * D:c0 + 4 * D], st.bcs_t[l], xin,

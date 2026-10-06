@@ -131,6 +131,17 @@ def run(mode: str, yamls: List[str], out_dir: str, seeds: List[int], *, tag: Opt
         eff = _settings.worker_settings(mode, settings)                  # `boltz predict`'s own options over upstream's defaults; a knob the worker line cannot serve is named
     except ValueError as e:
         rep.say(rep.not_active_line(f"settings: {e}")); rep.set_rc(rep.EXIT_USAGE); return rep.EXIT_USAGE
+    from . import batching as _batching                               # BOLTZ_BATCH_SIZE > 1: several inputs per predict step (batching.py — not upstream behaviour; --mode fast, one GPU)
+    try:
+        batch_n, batch_pad = _batching.size(), _batching.max_pad()
+    except ValueError as e:
+        rep.say(rep.not_active_line(f"batching: {e}")); rep.set_rc(rep.EXIT_USAGE); return rep.EXIT_USAGE
+    if batch_n > 1 and (row["mode"] not in _batching.MODES or P > 1):
+        rep.say(rep.not_active_line(f"batching: {_batching.ENV_SIZE}={batch_n} is served on --mode {'|'.join(_batching.MODES)} at n_gpu=1 only (this run: --mode {row['mode']}, n_gpu={P}); unset it for this run"))
+        rep.set_rc(rep.EXIT_USAGE); return rep.EXIT_USAGE
+    if batch_n > 1:
+        rep.say(f"[boltz2-opt] BATCH batch_size={batch_n} max_pad={batch_pad} — batched inference (not upstream behaviour): inputs bucketed by token count, per-record noise; "
+                f"results differ from a non-batched run of the same seed as two seeds do")
     modes.set_run_drops(eff["run_off"]); modes.set_n_gpu(P); row = modes.resolve(mode)       # levers this run takes off by name for an option they cannot carry (modes.RUN_DROPS; {} = the row as tabled):
                                                                       # stated once, before staging — every resolve() of this process (stage, child_env, evidence, the lines) agrees
     out_dir = os.path.abspath(out_dir); os.makedirs(out_dir, exist_ok=True)

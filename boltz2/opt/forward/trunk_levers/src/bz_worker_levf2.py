@@ -268,6 +268,115 @@ def predict_pipelined(dm, it_, st, out_dir, processed):
         pass
     return pred
 
+# ---------------- batched path (BOLTZ_BATCH_SIZE > 1; boltz2_opt.batching — NOT upstream behaviour): several different inputs per predict step, padded;
+# buckets by token count, per-record noise / featurizer streams, the confidence module and stock's writer per record. A batch that fails (boltz's own
+# out-of-memory catch, or a lever / upstream statement that cannot carry the batch) is re-run record by record, by name ----------------
+from boltz2_opt import batching as BT
+BATCH_N = BT.size()
+if args.pipeline and BATCH_N > 1:
+    from torch.utils.data import DataLoader
+    from boltz2_opt import sampler as _KS
+    MODEL.to(DEV); MODEL.eval()
+    SMOD = (_KS._STATE.get("mod") if "rollout" in (_KS._STATE.get("applied") or ()) else None)   # the roll-out module (bz_sampler): carries B records with per-record noise; absent (the run dropped it by name) -> batches of one
+    BT.install()
+    LOG["env"]["batching"] = {"batch_size": BATCH_N, "max_pad": BT.max_pad(), "sampler": "rollout" if SMOD is not None else "absent:batches_of_one"}
+    ev("batching", **LOG["env"]["batching"])
+    def writer_collect():
+        rows = {(r["name"], r["seed"]): r for r in LOG["per_item"]}
+        for c in WR.collect():
+            row = rows.get((c["name"], c["seed"]))
+            if row is not None:
+                if c["kind"] == "write": row["bg_write_s"] = c.get("write_s")
+                else: row["files"] = c.get("files"); row["bg_move_s"] = c.get("move_s"); row["writer"] = "done" if c["ok"] else "failed"
+            if not c["ok"]:
+                uid = next((i.get("uid") for i in ITEMS if i["name"] == c["name"]), None)
+                LOG.setdefault("failed", []).append({"name": c["name"], "uid": uid, "seed": c["seed"], "reason": f"writer_overlap {c['kind']} failed: {c.get('error')}", "utc": utc()})
+                ev("item_failed", item=str(c["name"])[:40], seed=c["seed"], reason=f"writer_overlap:{c['kind']}:{c.get('error')}"[:200])
+    UNITS = []
+    for it in ITEMS:                                                 # parse every input first (the zygote's fresh child per input, as the pipelined path): the buckets need every record
+        out_dir, processed, t_proc, skip = process_item(it)
+        if skip:
+            continue
+        rec = next(r for r in processed.manifest.records if r.id == it["name"])
+        if rec.affinity: warm_affinity_leg(processed)
+        opt = rec.inference_options
+        guided = bool(OPTS.get("use_potentials")) or bool(opt is not None and (getattr(opt, "pocket_constraints", None) or getattr(opt, "contact_constraints", None)))
+        UNITS.append({"name": it["name"], "it": it, "out_dir": out_dir, "processed": processed, "t_proc": t_proc, "manifest": processed.manifest,
+                      "targets_dir": processed.targets_dir, "msa_dir": processed.msa_dir, "constraints_dir": processed.constraints_dir,
+                      "template_dir": processed.template_dir, "extra_mols_dir": processed.extra_mols_dir, "ntok": BT.n_tokens_hint(rec),
+                      "alone": bool(rec.affinity) or guided or SMOD is None})   # upstream's affinity leg and per-step steering / guidance are single-record
+    BID = [0]
+    def write_group(pred, singles, recs, idxs, s, t_pred, digs, bid, conf):
+        n = len(idxs)
+        for b, i in enumerate(idxs):
+            u = UNITS[i]; it = u["it"]; t_item = time.time()
+            WR.begin_item(it["name"], s)
+            writer = BoltzWriter(data_dir=u["targets_dir"], output_dir=u["out_dir"] / "predictions", output_format=B["output_format"], boltz2=True, write_embeddings=bool(OPTS.get("write_embeddings", False)))
+            pb = BT.record_prediction(pred, b, singles[b], PRED["diffusion_samples"], conf[b] if conf else None)
+            t_write = time.time()
+            with torch.inference_mode():
+                writer.write_on_batch_end(None, MODEL, pb, None, {"record": [recs[b]]}, 0, 0)   # stock's single-record writer body, once per record
+            t_write = time.time() - t_write
+            t_aff = run_affinity_leg(u["out_dir"], u["processed"], it, s) if n == 1 else None
+            pdir = u["out_dir"] / "predictions" / it["name"]; dst = OUT / "by_seed" / it["name"] / f"s{s}"; dst.mkdir(parents=True, exist_ok=True)
+            files = WR.finish_item(it["name"], s, pdir, dst)
+            LOG["per_item"].append({**digs, "name": it["name"], "uid": it.get("uid"), "seed": s, "predict_s": round(t_pred / n, 3), "batch_predict_s": round(t_pred, 3),
+                                    "item_s": round(t_pred / n + (time.time() - t_item), 3), "write_call_s": round(t_write, 3), "process_inputs_s": u["t_proc"], "affinity_s": t_aff,
+                                    "files": [os.path.basename(f) for f in files] if files is not None else None, "finished_utc": utc(), "pipeline": 1,
+                                    "batch_id": bid, "batch_n": n, "batch_tokens": int(pred["token_masks"].shape[1]), "n_tokens": int(singles[b]["token_pad_mask"].shape[1]),
+                                    **({"writer": "pending"} if files is None else {})})
+            ev("item_done", item=it["name"][:40], seed=s, batch=bid, batch_n=n, predict_s=round(t_pred / n, 2), model_s=digs.get("model_s"))
+    def run_group(batch, singles, idxs, s):
+        n = len(idxs); recs = list(batch["record"]); BID[0] += 1; bid = BID[0]
+        rng_set(POST_CTOR[s])                                        # every batch starts at the pass's post-construction streams; the sampler's noise is per record (below)
+        if SMOD is not None: SMOD.BATCH["seeds"] = [BT.record_seed(s, UNITS[i]["name"]) for i in idxs]
+        BT.CTX["conf"] = None; err = None; pred = None
+        torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize(); t_pred = time.time(); DIGS["last"] = {}
+        try:
+            with torch.inference_mode():
+                batch = BT.to_device(batch, DEV); singles = [x if x is batch else BT.to_device(x, DEV) for x in singles]
+                BT.CTX["singles"] = singles
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    pred = MODEL.predict_step(batch, 0, 0)
+            if pred.get("exception"): err = "out of memory (boltz's own catch in predict_step)"
+        except Exception as e:                                       # a statement that cannot carry this batch: named, and the records re-run one by one
+            if n == 1: raise
+            import traceback; traceback.print_exc(); err = f"{type(e).__name__}: {e}"[:300]
+        finally:
+            BT.CTX["singles"] = None
+            if SMOD is not None: SMOD.BATCH["seeds"] = None
+        torch.cuda.synchronize(); t_pred = time.time() - t_pred
+        if err is not None and n > 1:
+            LOG.setdefault("batch_fallbacks", []).append({"batch_id": bid, "n": n, "names": [UNITS[i]["name"] for i in idxs], "seed": s, "reason": err, "utc": utc()})
+            print(f"[boltz2-opt] BATCH batch={bid} n={n} fell back to one record per step: {err}", flush=True); ev("batch_fallback", batch=bid, n=n, reason=err[:160])
+            pred = None; torch.cuda.empty_cache()
+            for b, i in enumerate(idxs):
+                run_group(singles[b], [singles[b]], [i], s)
+            return
+        if err is not None:                                          # a batch of one that boltz skipped on out of memory: the unit is FAILED by name, as on the pipelined path
+            u = UNITS[idxs[0]]; why = SK.upstream_skipped(DIGS.get("last")) or err
+            LOG.setdefault("failed", []).append({"name": u["name"], "uid": u["it"].get("uid"), "seed": s, "reason": why, "utc": utc()}); ev("item_failed", item=u["name"][:40], seed=s, reason=why)
+            return
+        write_group(pred, singles, recs, idxs, s, t_pred, dict(DIGS.get("last", {})), bid, BT.CTX["conf"])
+        writer_collect()
+        json.dump(LOG, open(KD / f"{B['tag']}_worker_log.json", "w"), indent=1)
+    GROUPS = BT.plan([u["ntok"] for u in UNITS], BATCH_N, BT.max_pad(), [u["alone"] for u in UNITS])
+    LOG["env"]["batching"]["groups"] = [len(g) for g in GROUPS]
+    print(f"[boltz2-opt] BATCH plan: {len(UNITS)} input(s) in {len(GROUPS)} batch(es) of sizes {sorted(set(len(g) for g in GROUPS))} "
+          f"(batch_size={BATCH_N}, max_pad={BT.max_pad()}, alone={sum(1 for u in UNITS if u['alone'])})", flush=True)
+    for s in SEEDS_ALL:
+        if not UNITS: break
+        ds = BT.Records(UNITS, mol_dir, s, OPTS.get("method"))
+        dl = DataLoader(ds, batch_sampler=GROUPS, collate_fn=BT.collate_group, num_workers=max(1, args.num_workers), pin_memory=False)
+        for gi, pack in enumerate(dl):                               # the loader's workers featurize the next batches while this one predicts
+            run_group(pack["batch"], pack["singles"] if len(GROUPS[gi]) > 1 else [pack["batch"]], GROUPS[gi], s)
+        del dl, ds
+    WCENSUS = WR.join(); writer_collect(); LOG["writer_census"] = WCENSUS
+    LOG["batching"] = {**BT.describe(), "batches": BID[0], "fallbacks": len(LOG.get("batch_fallbacks", []))}
+    LOG["total_wall_s"] = round(time.time() - T0, 1)
+    json.dump(LOG, open(KD / f"{B['tag']}_worker_log.json", "w"), indent=1)
+    ev("done", total_s=LOG["total_wall_s"], writer_failed=WR.failed_count(), batches=BID[0]); sys.exit(1 if WR.failed_count() else 0)
+
 if args.pipeline:
     MODEL.to(DEV); MODEL.eval()
     def writer_collect():
