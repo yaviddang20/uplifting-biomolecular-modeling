@@ -205,6 +205,34 @@ _CFG = {"rollout": None, "kabsch": "torch", "dit": None, "max_tokens": 0}   # ma
                                                                             # is served by the inner (stock eager) loop BY NAME — scope word above_max_tokens — with the fused step prepared
 _AC = {"mod": None}              # the aligncap module, opt/forward/waste (BOLTZ_SAMPLER_ALIGN=aligncap): the bitwise cusolverDnSgesvd seam into static buffers
 _DIT = {"mod": None}            # bz_sampler_dit (the fused token-transformer step), when its words are installed
+BATCH = {"seeds": None}         # batched inference (boltz2_opt.batching): one 63-bit noise seed per record of the NEXT sample() call, set by the batched worker loop; a record's
+                                # draws then depend on (seed, record) only — never on its batch-mates, its slot or the padded atom count
+
+
+def _predraw_records(n_atoms, A, m, S, device, dtype):
+    """The roll-out's randomness for a padded batch of B records x m samples (rows record-major, as repeat_interleave lays them out): every
+    record draws from ITS OWN generator, in its own unpadded shape ([m, A_b, 3] with A_b = its atom count rounded up to the 32-atom window,
+    the shape a single-record run draws), so a record's noise is a function of (its seed, A_b, m, S) alone. Padded atoms get no noise (zeros).
+    Returns (init [B*m, A, 3], R [S, B*m, 3, 3], tr [S, B*m, 1, 3], noise [S, B*m, A, 3])."""
+    B0 = len(n_atoms); Bm = B0 * m
+    seeds = BATCH.get("seeds")
+    if seeds is None or len(seeds) != B0:                                 # no per-record seeds handed over: derive them from the process's CUDA stream (reproducible per batch, not per record)
+        seeds = [int(x) for x in torch.randint(0, 2 ** 62, (B0,), device=device).tolist()]
+    init = torch.zeros((Bm, A, 3), device=device, dtype=torch.float32)
+    Q = torch.empty((S, Bm, 4), device=device, dtype=dtype)
+    tr = torch.empty((S, Bm, 1, 3), device=device, dtype=dtype)
+    noise = torch.zeros((S, Bm, A, 3), device=device, dtype=dtype)
+    for b in range(B0):
+        Ab = min(A, -(-int(n_atoms[b]) // 32) * 32)
+        g = torch.Generator(device=device); g.manual_seed(int(seeds[b]) % (2 ** 63 - 1))
+        sl = slice(b * m, (b + 1) * m)
+        init[sl, :Ab] = torch.randn((m, Ab, 3), device=device, generator=g)
+        Q[:, sl] = torch.randn((S, m, 4), dtype=dtype, device=device, generator=g)
+        tr[:, sl] = torch.randn((S, m, 1, 3), dtype=dtype, device=device, generator=g)
+        noise[:, sl, :Ab] = torch.randn((S, m, Ab, 3), dtype=dtype, device=device, generator=g)
+    R = torch.stack([_rotations_from_quaternion_draws(Q[k]) for k in range(S)])
+    STATS["predraw"] = "records"
+    return init, R, tr, noise
 
 
 def _log(*a):
@@ -509,18 +537,37 @@ def _rollout(self, atom_mask, num_sampling_steps, multiplicity, max_parallel_sam
     if max_parallel_samples is None:
         max_parallel_samples = multiplicity
     num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
+    B0 = int(atom_mask.shape[0])                                                 # records in this call: 1 = stock's single-record sample(), every statement below as before
+    batched = B0 > 1 or BATCH.get("seeds") is not None                           # batched inference (B0 > 1, or a batch of ONE from the batched worker loop: the same statements, so a
+                                                                                 # record's result does not depend on its batch size): per-record noise, record-major sample chunks, masked centring
+    n_atoms = [int(x) for x in atom_mask.sum(dim=-1).tolist()] if batched else None
     atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
     shape = (*atom_mask.shape, 3)
     Bm, A = int(shape[0]), int(shape[1])
     S = int(num_sampling_steps)
     device = atom_mask.device
     TL = _Timeline(_DEBUG); TL.mark("enter")
+    if batched:
+        _mk = atom_mask.to(torch.float32)[..., None]; _cnt = _mk.sum(dim=-2, keepdim=True).clamp_min(1.0)
+
+        def _centre(x):
+            """the centroid over REAL atoms only (training's center_random_augmentation), padded atoms held at the origin: in a padded batch a
+            short record's unmasked mean (stock's inference statement) would be dragged by its padding."""
+            mk = _mk.to(x.dtype)
+            xm = torch.where(mk.bool(), x, torch.zeros_like(x))
+            return xm - (xm.sum(dim=-2, keepdim=True) / _cnt.to(x.dtype)) * mk
+    else:
+        def _centre(x):
+            return x - x.mean(dim=-2, keepdims=True)                             # stock 353
     sigmas_t, sig, gam = _host_schedule(self, S)
     step_scale = self.step_scale
     host, t_hat_np, sq_np, rc_np, cf_np = _step_scalars(self, sig, gam, S, step_scale, STATS["div_recipe"])
     TL.mark("sched")
     # ---- all randomness, stock order ----
-    init, R_tab, tr_tab, noise_tab = _predraw(shape, multiplicity, S, device, torch.float32)
+    if batched:
+        init, R_tab, tr_tab, noise_tab = _predraw_records(n_atoms, A, multiplicity, S, device, torch.float32)
+    else:
+        init, R_tab, tr_tab, noise_tab = _predraw(shape, multiplicity, S, device, torch.float32)
     TL.mark("predrawn")
     init_sigma = sigmas_t[0]
     atom_coords = init_sigma * init                                              # stock 344-345: init_sigma (0-dim device tensor) * torch.randn(shape)
@@ -529,6 +576,8 @@ def _rollout(self, atom_mask, num_sampling_steps, multiplicity, max_parallel_sam
         tab.copy_(torch.from_numpy(arr).to(device))
     sample_ids = torch.arange(multiplicity).to(device)
     chunks = list(sample_ids.chunk(multiplicity % max_parallel_samples + 1))
+    if batched:                                                                  # the same sample chunks, taken for every record at once: row ids record-major (b * multiplicity + j)
+        chunks = [(torch.arange(B0, device=device)[:, None] * multiplicity + c[None, :]).reshape(-1) for c in chunks]
     for c in chunks:
         roll.sigma[int(c.numel())] = torch.zeros((int(c.numel()),), device=device, dtype=torch.float32)
     guard1 = bool(torch.any(atom_mask.float().sum(dim=-1) < (3 + 1)))          # weighted_rigid_align guard 1: the mask is step-invariant
@@ -545,7 +594,7 @@ def _rollout(self, atom_mask, num_sampling_steps, multiplicity, max_parallel_sam
                     sg = roll.sigma[n]; sg.copy_(sigma.expand(n))                # == torch.full((batch,), t_hat, device=device)
                 else:
                     sg = sigma
-                chunk = self.preconditioned_network_forward(atom_coords_noisy[ids], sg, network_condition_kwargs=dict(multiplicity=n, **nck))
+                chunk = self.preconditioned_network_forward(atom_coords_noisy[ids], sg, network_condition_kwargs=dict(multiplicity=n // B0, **nck))   # samples PER RECORD in this chunk
                 atom_coords_denoised[ids] = chunk
         return atom_coords_denoised
 
@@ -560,7 +609,7 @@ def _rollout(self, atom_mask, num_sampling_steps, multiplicity, max_parallel_sam
 
     # ---- step 0, eager (stock statements; also the capture's warm-up: the hoist's caches are (re)built here) ----
     random_R, random_tr = R_tab[0], tr_tab[0]
-    atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+    atom_coords = _centre(atom_coords)
     atom_coords = torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
     th0, sq0, c0, sigma_t0 = host[0]
     eps = sq0 * noise_tab[0]                                                     # == sqrt(noise_var) * torch.randn(shape)
@@ -610,10 +659,11 @@ def _rollout(self, atom_mask, num_sampling_steps, multiplicity, max_parallel_sam
         x = atom_coords_next
         roll.ctr.add_(1)                                                         # ---- head of step ctr+1 ----
         R = R_tab.index_select(0, roll.ctr)[0]; tr = tr_tab.index_select(0, roll.ctr)[0]
-        x = x - x.mean(dim=-2, keepdims=True)
+        x = _centre(x)
         x = torch.einsum("bmd,bds->bms", x, R) + tr
         den_prev = roll.den                                                      # stock 358-363 on the previous denoised (a dead value in stock too)
-        den_prev -= den_prev.mean(dim=-2, keepdims=True)
+        if not batched:
+            den_prev -= den_prev.mean(dim=-2, keepdims=True)
         den_prev = torch.einsum("bmd,bds->bms", den_prev, R) + tr
         eps_ = roll.sqrt_nv_tab.index_select(0, roll.ctr) * noise_tab.index_select(0, roll.ctr)[0]
         noisy = x + eps_

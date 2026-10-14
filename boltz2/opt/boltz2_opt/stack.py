@@ -1281,7 +1281,7 @@ def evidence(mode: str, worker_log: Optional[dict], stdout_text: str = "", attac
             from . import settings as _settings
             S = int(sampling_steps if sampling_steps is not None else _settings.stock_defaults()["sampling_steps"])
             n_scoped = sum(int(n) for k, n in (st.get("scope") or {}).items() if k != "above_max_tokens")   # calls the stock sampler served BY NAME (above_max_tokens: counted as gated items above) (steering / force=true constrained inputs): no capture for those
-            n_in = len([it for it in items if it not in gated]) - n_scoped
+            n_in = len({it.get("batch_id", (it.get("name"), it.get("seed"))) for it in items if it not in gated}) - n_scoped   # sample() calls in scope: one per (input, seed) unit, or one per BATCH of a batched run (batching.py: the rows of a batch share its batch_id)
             want_k = {"aligncap": "aligncap", "jacobi64": "device"}.get(env.get("BOLTZ_SAMPLER_ALIGN") or "", "torch")   # the row's rigid-alignment seam as the roll-out reports it (sampler stats.kabsch): the bitwise gesvd seam / the in-graph Kabsch / stock torch
             if env.get("BOLTZ_SAMPLER_ROLLOUT") == "graph" and n_in > 0 and st.get("kabsch") != want_k:
                 problems.append(f"roll-out alignment: kabsch={st.get('kabsch')} but the row's BOLTZ_SAMPLER_ALIGN={env.get('BOLTZ_SAMPLER_ALIGN') or '-'} wants {want_k} (the alignment lever is not serving)")

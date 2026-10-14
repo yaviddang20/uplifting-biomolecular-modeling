@@ -583,7 +583,18 @@ def _distinct_sample_chunks(given: dict) -> bool:
     return len(set(_settings.upstream_sample_chunks(D, Mps))) > 1
 
 
+def _batched_run(given: dict) -> bool:
+    """BOLTZ_BATCH_SIZE > 1 (batching.py: several inputs per predict step — not an upstream option, so it is read from the environment)."""
+    from . import batching
+    try:
+        return batching.size() > 1
+    except ValueError:
+        return False
+
+
 RUN_DROPS: Dict[str, dict] = {
+    "batch_size": {"modes": ("fast",), "levers": ("prefetch",), "when": _batched_run},   # the persistent featurizer hands over ONE record per step by construction: a batched run
+                                                             # featurizes through the batched loop's own DataLoader (its workers prefetch the next batches) and takes the lever off by name
     "use_potentials": {"modes": ("exact", "fast", "big"), "levers": ("rollout", "graph_sampler", "dit_hoist")},   # big carries the roll-out and the hoist up to its ceiling: the same words
     "distinct_sample_chunks": {"modes": ("exact", "fast", "big"), "levers": ("rollout", "graph_sampler", "dit_hoist"), "when": _distinct_sample_chunks},
                                                              # a run whose sample chunks have DISTINCT sizes per denoising step (upstream's own chunking of --diffusion_samples by
