@@ -147,6 +147,13 @@ AF3 JSON: standard AlphaFold3 input format. Copy the example at
 Either run single-sequence (`msa: empty`, less accurate), or precompute `.a3m` MSAs on the login node or elsewhere
 and point to them (`msa: /path/x.a3m` in YAML; paste into `unpairedMsa` in AF3 JSON).
 
+**Why MSAs matter (measured here).** Without an MSA, Boltz-2 / AF3 often cannot determine a natural protein's structure: on
+barnase/barstar complexes with `msa: empty` (pLDDT ~0.4), two runs that differ only by floating-point rounding (`exact` vs `fast`, same
+seed) gave structures 7-18 A apart, and two seeds about 14 A apart. A designed protein predicted confidently without an MSA (Top7,
+pLDDT ~0.85) agreed to ~0.4 A. Read the confidence scores first: low pLDDT / ipTM means the coordinates are unreliable in ANY mode, and
+re-running with another seed will move them. For real work, precompute MSAs on the login node. When it matters, run several seeds
+(or `--diffusion_samples`) and check that they agree.
+
 ## Modes
 
 | mode | what |
@@ -158,6 +165,13 @@ and point to them (`msa: /path/x.a3m` in YAML; paste into `unpairedMsa` in AF3 J
 
 Every run prints `ACTIVE mode=...`. `NOT ACTIVE: <reason>` + exit code 3 means it refused to run and tells you why.
 The first run of each mode compiles kernels (~1 min); later runs reuse `kit_out/<kit>/jit/`.
+
+## Batched Boltz-2 (experimental, branch `boltz2-batching`)
+
+Several different inputs per GPU step on `--mode fast` (`BOLTZ_BATCH_SIZE=N`): roughly 1.2-2.5x throughput on 100-200-residue inputs
+in the tests so far, matching non-batched structures to ~0.2 A on a confident protein. Not in the `main` images and not yet tested with
+MSAs. Usage, validation numbers and limits: `boltz2/BATCHING.md` on that branch
+(https://github.com/yaviddang20/uplifting-biomolecular-modeling/blob/boltz2-batching/boltz2/BATCHING.md).
 
 ## Full docs
 
