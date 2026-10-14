@@ -46,7 +46,36 @@ def units(root):
     return out
 
 
+def emb(root):
+    out = {}
+    for f in sorted(glob.glob(os.path.join(root, "by_seed", "*", "s*", "embeddings_*.npz"))):
+        d = os.path.dirname(f); out[(os.path.basename(os.path.dirname(d)), os.path.basename(d))] = f
+    return out
+
+
+def main_emb(a_dir, b_dir):
+    """--emb: the trunk's single (s) and pair (z) embeddings of each record, side by side: relative L2 difference and the largest absolute
+    difference. No diffusion in between: rounding shows as ~1e-2 or less, a masking / padding defect as O(1)."""
+    A, B = emb(a_dir), emb(b_dir)
+    print(f"{'record':<22}{'seed':<6}{'s_shape':>16}{'s_rel':>10}{'s_maxabs':>10}{'z_rel':>10}{'z_maxabs':>10}")
+    bad = False
+    for key in sorted(set(A) | set(B)):
+        if key not in A or key not in B:
+            print(f"{key[0]:<22}{key[1]:<6} embeddings MISSING in {'A' if key not in A else 'B'}"); bad = True; continue
+        da, db = np.load(A[key]), np.load(B[key])
+        row = f"{key[0]:<22}{key[1]:<6}{str(tuple(da['s'].shape)):>16}"
+        for k in ("s", "z"):
+            x, y = da[k].astype(np.float64), db[k].astype(np.float64)
+            if x.shape != y.shape:
+                row += f"  {k} shape differs {x.shape} vs {y.shape}"; bad = True; continue
+            row += f"{np.linalg.norm(x - y) / max(np.linalg.norm(x), 1e-30):>10.2e}{np.abs(x - y).max():>10.3f}"
+        print(row)
+    return 1 if bad else 0
+
+
 def main(argv):
+    if "--emb" in argv:
+        return main_emb(argv[1], argv[2])
     a_dir, b_dir = argv[1], argv[2]
     lim = float(argv[argv.index("--max-rmsd") + 1]) if "--max-rmsd" in argv else None
     A, B = units(a_dir), units(b_dir)

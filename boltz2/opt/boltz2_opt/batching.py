@@ -232,5 +232,27 @@ def record_prediction(pred: dict, b: int, single: dict, multiplicity: int, conf:
     return out
 
 
+def raise_fd_limit(want: int = 65536) -> dict:
+    """Before the batched DataLoader starts: its workers pass each tensor of a batch to the predicting process as a shared-memory file
+    descriptor (torch's default sharing strategy), a few hundred per record — raise this process's soft RLIMIT_NOFILE towards the hard limit
+    (the workers inherit it); when it cannot reach 8192, switch torch to the file_system strategy (no descriptor per tensor)."""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    out = {"soft_before": soft, "hard": hard, "strategy": None}
+    inf = resource.RLIM_INFINITY
+    if soft != inf and soft < want:
+        new = want if hard == inf else min(hard, want)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (max(new, soft), hard))
+        except (ValueError, OSError):
+            pass
+    out["soft"] = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if out["soft"] != inf and out["soft"] < 8192:
+        import torch.multiprocessing as tmp
+        tmp.set_sharing_strategy("file_system"); out["strategy"] = "file_system"
+    CTX["fd_limit"] = out
+    return out
+
+
 def describe() -> dict:
-    return {"batch_size": size(), "max_pad": max_pad(), "confidence_calls": CTX["calls"], "confidence_records": CTX["records"], "installed": CTX["installed"]}
+    return {"batch_size": size(), "max_pad": max_pad(), "confidence_calls": CTX["calls"], "confidence_records": CTX["records"], "installed": CTX["installed"], "fd_limit": CTX.get("fd_limit")}

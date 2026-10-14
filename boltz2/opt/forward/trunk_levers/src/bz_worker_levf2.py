@@ -364,6 +364,7 @@ if args.pipeline and BATCH_N > 1:
     LOG["env"]["batching"]["groups"] = [len(g) for g in GROUPS]
     print(f"[boltz2-opt] BATCH plan: {len(UNITS)} input(s) in {len(GROUPS)} batch(es) of sizes {sorted(set(len(g) for g in GROUPS))} "
           f"(batch_size={BATCH_N}, max_pad={BT.max_pad()}, alone={sum(1 for u in UNITS if u['alone'])})", flush=True)
+    LOG["env"]["batching"]["fd_limit"] = BT.raise_fd_limit()        # the loader's workers hand every feature tensor over as a shared-memory file descriptor: a batch of 8 records exceeds a 1024 soft limit
     for s in SEEDS_ALL:
         if not UNITS: break
         ds = BT.Records(UNITS, mol_dir, s, OPTS.get("method"))
