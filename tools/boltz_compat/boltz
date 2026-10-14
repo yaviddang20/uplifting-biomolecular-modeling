@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""boltz — a drop-in stand-in for upstream's `boltz predict` CLI (boltz 2.2.1) that runs the boltz2 optimization kit's container.
+
+Tools that shell out to `boltz predict ...` and then read its output files (e.g. NISE: --boltz-executable) can point at this script instead
+and change nothing else:
+
+  * takes upstream's arguments: `boltz predict <file|dir> --out_dir X [--devices N] [--cache C] [any other predict option]`
+  * `--devices N`: the inputs are split into N shards, one kit process per GPU (data-parallel; upstream uses DDP), on the GPUs named by
+    CUDA_VISIBLE_DEVICES (else 0..N-1)
+  * writes upstream's layout: X/boltz_results_<input stem>/predictions/<name>/<name>_model_0.<pdb|cif>, confidence_*.json, plddt_*.npz,
+    pae_*/pde_*.npz, affinity_<name>.json — the files themselves are written by upstream's own writer inside the kit, unchanged
+  * BOLTZ_BATCH_SIZE / BOLTZ_BATCH_MAX_PAD in the environment pass through (batched inference needs the boltz2-batching branch's kit code:
+    BOLTZ_KIT_CODE)
+
+Settings (environment):
+  KIT_BASE           directory holding uplifting-biomolecular-modeling/, weights/, kit_out/  (default: two levels above this script's repo)
+  BOLTZ_KIT_SIF      the boltz2 image                       (default: $KIT_BASE/uplifting-biomolecular-modeling/boltz2.sif)
+  BOLTZ_KIT_WEIGHTS  the Boltz-2 cache on the host          (default: --cache if given, else $KIT_BASE/weights/boltz2)
+  BOLTZ_KIT_MODE     kit mode: fast (default) | exact | off  (`--no_kernels` or `--model boltz1` force `off`: plain upstream boltz in the image)
+  BOLTZ_KIT_CONFIG   h100 | h200 | a100                     (default: from the GPU's name)
+  BOLTZ_KIT_CODE     a checkout whose boltz2/ and common/ are bound over the image's kit code (e.g. the boltz2-batching branch); unset = the image's
+  BOLTZ_KIT_KEEP     1 = keep the kit's working directories under X/.boltz_kit/ (default: removed after a run that produced every output)
+
+Exit code: 0 when every input has its structure file, else the largest kit exit code (or 1). Upstream returns 0 in more cases; tools that
+check for the files themselves (NISE does) are unaffected.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+# upstream `boltz predict` options (boltz 2.2.1 main.py): flags and value options
+FLAGS = {"--write_full_pae", "--write_full_pde", "--override", "--use_msa_server", "--use_potentials", "--affinity_mw_correction",
+         "--subsample_msa", "--no_kernels", "--write_embeddings"}
+VALUED = {"--out_dir", "--cache", "--checkpoint", "--devices", "--accelerator", "--recycling_steps", "--sampling_steps", "--diffusion_samples",
+          "--max_parallel_samples", "--step_scale", "--output_format", "--num_workers", "--seed", "--msa_server_url", "--msa_pairing_strategy",
+          "--msa_server_username", "--msa_server_password", "--api_key_header", "--api_key_value", "--model", "--method",
+          "--preprocessing-threads", "--sampling_steps_affinity", "--diffusion_samples_affinity", "--affinity_checkpoint", "--max_msa_seqs",
+          "--num_subsampled_msa"}
+HANDLED_HERE = {"--out_dir", "--cache", "--devices", "--accelerator", "--model", "--override"}   # not forwarded to the kit
+KIT_KNOBS = (FLAGS | VALUED) - HANDLED_HERE - {"--msa_server_username", "--msa_server_password", "--api_key_header", "--api_key_value"}
+PATH_OPTS = {"--checkpoint", "--affinity_checkpoint"}
+INPUT_SUFFIXES = (".fa", ".fas", ".fasta", ".yml", ".yaml")
+
+
+def say(*a):
+    print("[boltz-compat]", *a, file=sys.stderr, flush=True)
+
+
+def parse(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); sys.exit(0)
+    if argv[0] != "predict":
+        say(f"only `predict` is served (got {argv[0]!r})"); sys.exit(2)
+    data, opts, i = None, {}, 1
+    while i < len(argv):
+        a = argv[i]
+        key, val = (a.split("=", 1) + [None])[:2] if a.startswith("--") and "=" in a else (a, None)
+        if key in FLAGS:
+            opts[key] = True; i += 1
+        elif key in VALUED:
+            if val is None:
+                if i + 1 >= len(argv): say(f"{key} needs a value"); sys.exit(2)
+                val = argv[i + 1]; i += 1
+            opts[key] = val; i += 1
+        elif a.startswith("-"):
+            say(f"unknown option {a} (not a boltz 2.2.1 predict option)"); sys.exit(2)
+        elif data is None:
+            data = a; i += 1
+        else:
+            say(f"unexpected argument {a!r}"); sys.exit(2)
+    if data is None:
+        say("missing the input path (boltz predict <file|dir>)"); sys.exit(2)
+    return Path(data).resolve(), opts
+
+
+def inputs_of(data: Path):
+    if data.is_dir():
+        files = sorted(p for p in data.iterdir() if p.is_file() and p.suffix.lower() in INPUT_SUFFIXES)
+        if not files: say(f"no .yaml/.fasta inputs in {data}"); sys.exit(2)
+        return files
+    if data.is_file():
+        return [data]
+    say(f"no such input: {data}"); sys.exit(2)
+
+
+def gpu_config():
+    v = os.environ.get("BOLTZ_KIT_CONFIG")
+    if v:
+        return v
+    try:
+        name = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=30).stdout.splitlines()[0]
+    except Exception:
+        name = ""
+    for key, cfg in (("H200", "h200"), ("A100", "a100"), ("H100", "h100")):
+        if key in name.upper():
+            return cfg
+    say(f"GPU {name or '?'} has no kit config; using h100 (set BOLTZ_KIT_CONFIG to override)")
+    return "h100"
+
+
+def main():
+    data, o = parse(sys.argv[1:])
+    files = inputs_of(data)
+    out_dir = Path(o.get("--out_dir", "./")).resolve()
+    final = out_dir / f"boltz_results_{data.stem}"
+    pred_root = final / "predictions"
+    work = out_dir / ".boltz_kit"
+    here = Path(__file__).resolve()
+    base = Path(os.environ.get("KIT_BASE") or here.parents[3])
+    sif = Path(os.environ.get("BOLTZ_KIT_SIF") or base / "uplifting-biomolecular-modeling" / "boltz2.sif")
+    weights = Path(os.environ.get("BOLTZ_KIT_WEIGHTS") or o.get("--cache") or base / "weights" / "boltz2").resolve()
+    mode = os.environ.get("BOLTZ_KIT_MODE", "fast")
+    if o.get("--no_kernels") or o.get("--model", "boltz2") != "boltz2":
+        mode = "off"                                             # the kit's stock route: upstream's own CLI in the image, these options passed through
+    if o.get("--accelerator", "gpu") != "gpu":
+        say("only --accelerator gpu is served"); sys.exit(2)
+    if not sif.is_file():
+        say(f"no kit image at {sif} (set BOLTZ_KIT_SIF or KIT_BASE)"); sys.exit(2)
+    ndev = max(1, int(o.get("--devices", 1)))
+    vis = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip() != ""]
+    devs = (vis or [str(i) for i in range(ndev)])[:ndev]
+    nshard = min(len(devs), len(files))
+    cfg = gpu_config()
+
+    # kit arguments: upstream options forwarded by name (the kit takes upstream's spelling)
+    fwd = []
+    for k, v in o.items():
+        if k in KIT_KNOBS:
+            if k in PATH_OPTS:
+                v = str(Path(v).resolve())
+            fwd += [k] if v is True else [k, str(v)]
+    extra = ["--model", o["--model"]] if mode == "off" and o.get("--model") else []   # an option the kit does not take by name reaches upstream's CLI after `--` (stock route)
+    for k in ("--msa_server_username", "--msa_server_password", "--api_key_header", "--api_key_value"):
+        if k in o:
+            say(f"{k} is not forwarded (credentials stay out of the kit's command line); use a public MSA server or precomputed MSAs")
+
+    # shards: round-robin over the inputs sorted by size (similar loads per GPU)
+    if work.exists():
+        shutil.rmtree(work)
+    shards = [[] for _ in range(nshard)]
+    for j, f in enumerate(sorted(files, key=lambda p: (p.stat().st_size, p.name))):
+        shards[j % nshard].append(f)
+    binds = {str(base), str(data if data.is_dir() else data.parent), str(out_dir), str(Path.cwd())}
+    for k in PATH_OPTS:
+        if k in o:
+            binds.add(str(Path(o[k]).resolve().parent))
+    code = os.environ.get("BOLTZ_KIT_CODE")
+    jit = base / "kit_out" / "boltz2" / "jit"; jit.mkdir(parents=True, exist_ok=True)
+
+    def run(i):
+        sin = work / f"in_{i}"; sout = work / f"out_{i}"; sin.mkdir(parents=True)
+        for f in shards[i]:
+            os.symlink(f, sin / f.name)
+        cmd = ["apptainer", "run", "--nv", "--bind", f"{weights}:/weights/boltz2"]
+        if code:
+            cmd += ["--bind", f"{Path(code).resolve()}/boltz2:/kit/boltz2", "--bind", f"{Path(code).resolve()}/common:/kit/common"]
+        for b in sorted(binds):
+            cmd += ["--bind", b]
+        cmd += [str(sif), "pred", "--config", cfg, "--mode", mode, "--input", str(sin), "--out_dir", str(sout)] + fwd + (["--"] + extra if extra else [])
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=devs[i], BOLTZ_CACHE="/weights/boltz2", MODEL_OPT_JIT_ROOT=str(jit))
+        log = work / f"shard_{i}.log"
+        t = time.time()
+        with open(log, "w") as fh:
+            fh.write(" ".join(cmd) + "\n"); fh.flush()
+            rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT).returncode
+        say(f"shard {i}: GPU {devs[i]}, {len(shards[i])} input(s), mode {mode}, rc {rc}, {time.time() - t:.0f} s (log {log})")
+        if rc != 0:
+            sys.stderr.write("".join(open(log).readlines()[-15:]))
+        return rc
+
+    say(f"{len(files)} input(s) -> {nshard} GPU(s) {devs[:nshard]}, kit mode {mode}, config {cfg}"
+        + (f", batch size {os.environ['BOLTZ_BATCH_SIZE']}" if os.environ.get("BOLTZ_BATCH_SIZE") else "") + (f", kit code {code}" if code else ""))
+    with ThreadPoolExecutor(nshard) as ex:
+        rcs = list(ex.map(run, range(nshard)))
+
+    # upstream's layout: predictions/<name>/<files> (the kit writes by_seed/<name>/s<seed>/<files> with upstream's file names)
+    pred_root.mkdir(parents=True, exist_ok=True)
+    fmt = "pdb" if o.get("--output_format") == "pdb" else "cif"
+    missing = []
+    for i in range(nshard):
+        for f in shards[i]:
+            name = f.stem
+            seeds = sorted((work / f"out_{i}" / "by_seed" / name).glob("s*"))              # kit modes: by_seed/<name>/s<seed>/
+            stock = work / f"out_{i}" / f"boltz_results_in_{i}" / "predictions" / name      # --mode off: upstream's own layout under the shard's input name
+            src = seeds[0] if seeds else (stock if stock.is_dir() else None)              # one seed per call (upstream's --seed): the first seed directory
+            dst = pred_root / name
+            if src is not None:
+                if dst.exists():
+                    shutil.rmtree(dst)
+                dst.mkdir(parents=True)
+                for g in src.iterdir():
+                    shutil.move(str(g), str(dst / g.name))
+            if not (dst / f"{name}_model_0.{fmt}").is_file():
+                missing.append(name)
+    if missing:
+        say(f"{len(missing)} input(s) without a structure: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}")
+    elif os.environ.get("BOLTZ_KIT_KEEP") != "1":
+        shutil.rmtree(work, ignore_errors=True)
+    say(f"wrote {len(files) - len(missing)}/{len(files)} prediction(s) under {pred_root}")
+    sys.exit(0 if not missing else (max(rcs) or 1))
+
+
+if __name__ == "__main__":
+    main()
