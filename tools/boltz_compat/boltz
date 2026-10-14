@@ -87,6 +87,17 @@ def inputs_of(data: Path):
     say(f"no such input: {data}"); sys.exit(2)
 
 
+def wants_affinity(path: Path) -> bool:
+    """An input declaring upstream's affinity property (YAML `properties: - affinity:`)."""
+    if path.suffix.lower() not in (".yml", ".yaml"):
+        return False
+    try:
+        import re
+        return re.search(r"^\s*-\s*affinity\s*:", path.read_text(), re.M) is not None
+    except OSError:
+        return False
+
+
 def gpu_config():
     v = os.environ.get("BOLTZ_KIT_CONFIG")
     if v:
@@ -194,13 +205,16 @@ def main():
                 dst.mkdir(parents=True)
                 for g in src.iterdir():
                     shutil.move(str(g), str(dst / g.name))
-            if not (dst / f"{name}_model_0.{fmt}").is_file():
+            want = [f"{name}_model_0.{fmt}"] + ([f"affinity_{name}.json"] if wants_affinity(f) else [])   # upstream's affinity leg writes affinity_<name>.json for an input declaring the property
+            if not all((dst / w).is_file() for w in want):
                 missing.append(name)
     if missing:
-        say(f"{len(missing)} input(s) without a structure: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''}")
+        say(f"{len(missing)} input(s) without their structure / affinity file: {', '.join(missing[:10])}{' ...' if len(missing) > 10 else ''} (kit logs kept under {work})")
+    elif any(rcs):
+        say(f"every output is present but a kit process exited non-zero ({rcs}); its log is kept under {work}")
     elif os.environ.get("BOLTZ_KIT_KEEP") != "1":
         shutil.rmtree(work, ignore_errors=True)
-    say(f"wrote {len(files) - len(missing)}/{len(files)} prediction(s) under {pred_root}")
+    say(f"wrote {len(files) - len(missing)}/{len(files)} complete prediction(s) under {pred_root}")
     sys.exit(0 if not missing else (max(rcs) or 1))
 
 
