@@ -153,3 +153,5 @@ bash run.sh pred --config h100 --mode big --n_gpu 2 --input $Y --out_dir out/big
 - **`--use_potentials`** switches the graphed sampler off for that run (`LEVER name=rollout state=off reason=use_potentials`).
   An input declaring the affinity property gets upstream's affinity pass, unchanged, after its structure pass.
 - **Out of memory.** Under `fast` → use `big`; still out of memory → `big --n_gpu P`.
+- **Batched inference (this fork only, experimental).** `BOLTZ_BATCH_SIZE=N` with `--mode fast` predicts up to N different inputs per
+  GPU step. Not upstream behaviour; see [BATCHING.md](BATCHING.md) for usage, validation and what is untested.

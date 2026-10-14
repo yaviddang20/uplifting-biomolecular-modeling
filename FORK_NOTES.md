@@ -14,5 +14,8 @@ directly from each kit's Dockerfile. The kits themselves (`stock/`, `opt/`, `com
 Modified upstream file: `rfdiffusion3/environment/Dockerfile` gains a `WHEELS_FROM=local` branch (installs an apex wheel compiled by
 `tools/rfd3_apex` instead of the published one).
 
+Branch `boltz2-batching` (experimental): batched Boltz-2 inference, several inputs per GPU step on `--mode fast` — see
+[boltz2/BATCHING.md](boltz2/BATCHING.md). It modifies kit files under `boltz2/opt/` (listed there); `main` leaves every kit's code as released.
+
 Built and `check`ed on an H100 NVL with Apptainer 1.5.2: boltz2, af3_torch, boltzgen, complexa, rfdiffusion3 (and proteinmpnn built).
 Start with `tools/README.md`.
