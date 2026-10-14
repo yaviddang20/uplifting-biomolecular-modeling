@@ -16,6 +16,7 @@ export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SCRATCH:-${TMPDIR:-/tmp}}/apptain
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 out="${SIF_OUT:-$root/$kit.sif}"
 flags="${APPTAINER_BUILD_FLAGS---fakeroot}"
+[ -e "$out" ] && echo "note: $out exists and will be REPLACED (--force)"
 echo "building $out from $kit/environment/apptainer.native.def (flags: ${flags:-none})"
 # shellcheck disable=SC2086
-exec apptainer build $flags --warn-unused-build-args "$@" "$out" "$kit/environment/apptainer.native.def"
+exec apptainer build $flags --force --warn-unused-build-args "$@" "$out" "$kit/environment/apptainer.native.def"
