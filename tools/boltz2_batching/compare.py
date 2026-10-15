@@ -28,6 +28,24 @@ def read_cif_xyz(path):
     return np.asarray(xyz, dtype=np.float64)
 
 
+def read_pdb_xyz(path, chain=None, heavy_only=True):
+    """ATOM / HETATM coordinates of a PDB, in file order; `chain` restricts to one chain id (B = the ligand in boltz's output)."""
+    xyz = []
+    for line in open(path):
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        if chain is not None and line[21] != chain:
+            continue
+        if heavy_only and line[76:78].strip().upper() == "H":
+            continue
+        xyz.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+    return np.asarray(xyz, dtype=np.float64)
+
+
+def read_xyz(path, chain=None):
+    return read_pdb_xyz(path, chain) if path.endswith(".pdb") else read_cif_xyz(path)
+
+
 def kabsch_rmsd(a, b):
     a = a - a.mean(0); b = b - b.mean(0)
     u, s, vt = np.linalg.svd(a.T @ b)
@@ -40,9 +58,12 @@ def units(root):
     out = {}
     for d in sorted(glob.glob(os.path.join(root, "by_seed", "*", "s*"))):
         name = os.path.basename(os.path.dirname(d)); seed = os.path.basename(d)
-        cif = os.path.join(d, f"{name}_model_0.cif"); cj = os.path.join(d, f"confidence_{name}_model_0.json")
-        if os.path.isfile(cif):
-            out[(name, seed)] = (cif, json.load(open(cj)) if os.path.isfile(cj) else {})
+        cj = os.path.join(d, f"confidence_{name}_model_0.json")
+        for ext in ("cif", "pdb"):                                   # the kit writes upstream's --output_format
+            st = os.path.join(d, f"{name}_model_0.{ext}")
+            if os.path.isfile(st):
+                out[(name, seed)] = (st, json.load(open(cj)) if os.path.isfile(cj) else {})
+                break
     return out
 
 
@@ -80,17 +101,25 @@ def main(argv):
     lim = float(argv[argv.index("--max-rmsd") + 1]) if "--max-rmsd" in argv else None
     A, B = units(a_dir), units(b_dir)
     bad = False
-    print(f"{'record':<22}{'seed':<6}{'atoms':>7}{'rmsd_A':>9}{'conf_a':>9}{'conf_b':>9}{'plddt_a':>9}{'plddt_b':>9}")
+    print(f"{'record':<22}{'seed':<6}{'atoms':>7}{'rmsd_A':>9}{'lig_rmsd':>9}{'conf_a':>9}{'conf_b':>9}{'plddt_a':>9}{'plddt_b':>9}")
     rms = []
     for key in sorted(set(A) | set(B)):
         if key not in A or key not in B:
             print(f"{key[0]:<22}{key[1]:<6} MISSING in {'A' if key not in A else 'B'}"); bad = True; continue
-        xa, xb = read_cif_xyz(A[key][0]), read_cif_xyz(B[key][0])
+        xa, xb = read_xyz(A[key][0]), read_xyz(B[key][0])
         if xa.shape != xb.shape or len(xa) == 0:
             print(f"{key[0]:<22}{key[1]:<6} atom count differs: {xa.shape} vs {xb.shape}"); bad = True; continue
         r = kabsch_rmsd(xa, xb); rms.append(r)
+        lr = float("nan")                                            # ligand-only RMSD (chain B), superposed on the WHOLE complex: moves if the ligand pose differs
+        if A[key][0].endswith(".pdb"):
+            la, lb = read_xyz(A[key][0], "B"), read_xyz(B[key][0], "B")
+            if len(la) and la.shape == lb.shape:
+                ca_, cb_ = xa - xa.mean(0), xb - xb.mean(0)
+                u, _, vt = np.linalg.svd(ca_.T @ cb_); d = np.sign(np.linalg.det(u @ vt))
+                rot = u @ np.diag([1.0, 1.0, d]) @ vt
+                lr = float(np.sqrt((((la - xa.mean(0)) @ rot - (lb - xb.mean(0))) ** 2).sum(1).mean()))
         ca, cb = A[key][1], B[key][1]
-        print(f"{key[0]:<22}{key[1]:<6}{len(xa):>7}{r:>9.3f}{ca.get('confidence_score', float('nan')):>9.4f}{cb.get('confidence_score', float('nan')):>9.4f}"
+        print(f"{key[0]:<22}{key[1]:<6}{len(xa):>7}{r:>9.3f}{lr:>9.3f}{ca.get('confidence_score', float('nan')):>9.4f}{cb.get('confidence_score', float('nan')):>9.4f}"
               f"{ca.get('complex_plddt', float('nan')):>9.4f}{cb.get('complex_plddt', float('nan')):>9.4f}")
         if lim is not None and r > lim:
             bad = True
