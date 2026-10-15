@@ -9,8 +9,9 @@ production results until it has been validated on inputs like yours (`tools/bolt
 
 ## Turn it on
 
-Batching is controlled by environment variables. It is served on `--mode fast` with one GPU; any other mode or `--n_gpu > 1` refuses
-by name (exit 2).
+Batching is controlled by environment variables. It is served on `--mode fast`, one GPU PER PROCESS — several GPUs are used by running
+one process each (see "Several GPUs" below; `tools/boltz_compat/boltz --devices N` does that for you). Another mode, or the kit's own
+model-parallel `--n_gpu > 1`, refuses by name (exit 2).
 
 ```bash
 BOLTZ_BATCH_SIZE=4 bash run.sh pred --config h100 --mode fast --input <dir of yamls> --out_dir out/x
@@ -34,14 +35,24 @@ BOLTZ_BATCH_SIZE=4 BOLTZ_CACHE=/weights/boltz2 apptainer run --nv \
 
 ### Several GPUs
 
-The kit's `--n_gpu P` splits ONE large prediction across GPUs (model-parallel, `big` mode); it is not data-parallel and does not batch.
-For throughput across GPUs, split the inputs and run one independent process per GPU, each batching its own share:
+Batching and multiple GPUs compose: each process takes one GPU and batches its own share of the inputs. P GPUs x batch N = P*N inputs in
+flight. `tools/boltz_compat/boltz` does the splitting itself — this is one process per GPU, four batches of 8, 32 inputs at once:
+
+```bash
+BOLTZ_BATCH_SIZE=8 tools/boltz_compat/boltz predict <input dir> --out_dir <out> --devices 4
+```
+
+By hand, without the wrapper, the same thing is a shard per GPU:
 
 ```bash
 for g in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$g BOLTZ_BATCH_SIZE=8 <pred command> --input shard_$g/ --out_dir out/shard_$g & done; wait
 ```
 
-Because every input draws its own noise (below), its result does not depend on which GPU or shard it lands on.
+Because every input draws its own noise (below), its result does not depend on which GPU or shard it lands on — P GPUs give the same
+answers as one.
+
+What does NOT combine with batching is the kit's own `--n_gpu P`, which shards ONE large prediction's pair representation across GPUs
+(model-parallel, for inputs too big for one card, `big` mode). That is a different axis and refuses with batching by name.
 
 ## What changes
 
@@ -97,7 +108,7 @@ Boltz-2 MSAs and to treat low-pLDDT coordinates as unreliable in any mode.
 
 **Repeatability:** the same batched run twice gives identical structures (0.000 Å).
 
-**Speed** (model seconds per input after warm-up, one GPU; single measurements):
+**Speed** (model seconds per input after warm-up, one GPU per process; single measurements):
 
 | | ~100-residue monomers (H200) | ~190-token complexes (H200) | ~190-token complexes (H100 NVL) |
 |---|---|---|---|
@@ -111,7 +122,7 @@ Boltz-2 MSAs and to treat low-pLDDT coordinates as unreliable in any mode.
   Padding lengths up to a few standard sizes would fix this; not done.
 - **Untested:** MSAs (a second padded dimension: MSA depth), ligands / modified residues, templates, `--diffusion_samples > 1`,
   inputs above ~200 tokens, the out-of-memory fallback, `--write_full_pae` / `--write_full_pde`.
-- `fast` only; `--n_gpu 1` only (use one process per GPU, above).
+- `fast` only. Not combinable with the kit's model-parallel `--n_gpu > 1` (data-parallel multi-GPU is one process per GPU, above).
 - The structures of a batched and a non-batched run of one seed differ (see Randomness).
 
 ## Files
