@@ -19,6 +19,10 @@ Settings (environment):
   BOLTZ_KIT_MODE     kit mode: fast (default) | exact | off  (`--no_kernels` or `--model boltz1` force `off`: plain upstream boltz in the image)
   BOLTZ_KIT_CONFIG   h100 | h200 | a100                     (default: from the GPU's name)
   BOLTZ_KIT_CODE     a checkout whose boltz2/ and common/ are bound over the image's kit code (e.g. the boltz2-batching branch); unset = the image's
+  BOLTZ_KIT_PROCS    concurrent kit processes PER GPU (default 1). Each one predicts ONE record per step, so every result is
+                     bit-identical to a plain unbatched run, while the GPU overlaps their work — the throughput of batching
+                     WITHOUT changing any number. Use this, not BOLTZ_BATCH_SIZE, when outputs must match unbatched runs.
+                     Memory and GPU time are shared, so 2-4 is the useful range for small inputs; 1 = one process per GPU.
   BOLTZ_KIT_KEEP     1 = keep the kit's working directories under X/.boltz_kit/ (default: removed after a run that produced every output)
 
 Exit code: 0 when every input has its structure file, else the largest kit exit code (or 1). Upstream returns 0 in more cases; tools that
@@ -134,7 +138,14 @@ def main():
     ndev = max(1, int(o.get("--devices", 1)))
     vis = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d.strip() != ""]
     devs = (vis or [str(i) for i in range(ndev)])[:ndev]
-    nshard = min(len(devs), len(files))
+    try:
+        procs = max(1, int(os.environ.get("BOLTZ_KIT_PROCS", "1")))
+    except ValueError:
+        say(f"BOLTZ_KIT_PROCS={os.environ.get('BOLTZ_KIT_PROCS')!r} is not an integer"); sys.exit(2)
+    if procs > 1 and os.environ.get("BOLTZ_BATCH_SIZE", "1") not in ("", "1"):
+        say(f"BOLTZ_KIT_PROCS={procs} with BOLTZ_BATCH_SIZE={os.environ['BOLTZ_BATCH_SIZE']}: both multiply work per GPU; "
+            f"use PROCS alone for results identical to unbatched runs, BATCH_SIZE alone for the batched path")
+    nshard = min(len(devs) * procs, len(files))
     cfg = gpu_config()
 
     # kit arguments: upstream options forwarded by name (the kit takes upstream's spelling)
@@ -155,6 +166,7 @@ def main():
     shards = [[] for _ in range(nshard)]
     for j, f in enumerate(sorted(files, key=lambda p: (p.stat().st_size, p.name))):
         shards[j % nshard].append(f)
+    shard_dev = [devs[i % len(devs)] for i in range(nshard)]        # round-robin over the GPUs: `procs` shards land on each
     binds = {str(base), str(data if data.is_dir() else data.parent), str(out_dir), str(Path.cwd())}
     for k in PATH_OPTS:
         if k in o:
@@ -172,18 +184,18 @@ def main():
         for b in sorted(binds):
             cmd += ["--bind", b]
         cmd += [str(sif), "pred", "--config", cfg, "--mode", mode, "--input", str(sin), "--out_dir", str(sout)] + fwd + (["--"] + extra if extra else [])
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=devs[i], BOLTZ_CACHE="/weights/boltz2", MODEL_OPT_JIT_ROOT=str(jit))
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=shard_dev[i], BOLTZ_CACHE="/weights/boltz2", MODEL_OPT_JIT_ROOT=str(jit))
         log = work / f"shard_{i}.log"
         t = time.time()
         with open(log, "w") as fh:
             fh.write(" ".join(cmd) + "\n"); fh.flush()
             rc = subprocess.run(cmd, env=env, stdout=fh, stderr=subprocess.STDOUT).returncode
-        say(f"shard {i}: GPU {devs[i]}, {len(shards[i])} input(s), mode {mode}, rc {rc}, {time.time() - t:.0f} s (log {log})")
+        say(f"shard {i}: GPU {shard_dev[i]}, {len(shards[i])} input(s), mode {mode}, rc {rc}, {time.time() - t:.0f} s (log {log})")
         if rc != 0:
             sys.stderr.write("".join(open(log).readlines()[-15:]))
         return rc
 
-    say(f"{len(files)} input(s) -> {nshard} GPU(s) {devs[:nshard]}, kit mode {mode}, config {cfg}"
+    say(f"{len(files)} input(s) -> {nshard} process(es) over {len(devs)} GPU(s) {devs}" + (f" ({procs} per GPU)" if procs > 1 else "") + f", kit mode {mode}, config {cfg}"
         + (f", batch size {os.environ['BOLTZ_BATCH_SIZE']}" if os.environ.get("BOLTZ_BATCH_SIZE") else "") + (f", kit code {code}" if code else ""))
     with ThreadPoolExecutor(nshard) as ex:
         rcs = list(ex.map(run, range(nshard)))
