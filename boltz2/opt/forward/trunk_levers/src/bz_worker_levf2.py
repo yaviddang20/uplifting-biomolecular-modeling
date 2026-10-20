@@ -70,8 +70,8 @@ try:                                                                      # the 
     _NCPU = len(os.sched_getaffinity(0))
 except AttributeError:
     _NCPU = os.cpu_count() or 1
-PARSE_PROCS = max(1, int(os.environ.get("BOLTZ_PARSE_PROCS", "") or min(8, _NCPU)))   # default min(8, usable CPUs): outputs are
-                                                                          # bit-identical either way; BOLTZ_PARSE_PROCS=1 restores the single-zygote serial parse
+PARSE_PROCS = max(1, int(os.environ.get("BOLTZ_PARSE_PROCS", "") or _NCPU))   # default: every usable CPU (the pool is capped at the input
+                                                                          # count below). Outputs are bit-identical either way; BOLTZ_PARSE_PROCS=1 restores the single-zygote serial parse
 if PARSE_PROCS > 1 and len(B["items"]) > 1:
     import concurrent.futures as _cf
     from boltz2_opt import prep as _prep0

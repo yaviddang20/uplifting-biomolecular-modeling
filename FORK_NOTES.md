@@ -14,7 +14,7 @@ directly from each kit's Dockerfile. The kits themselves (`stock/`, `opt/`, `com
 Modified upstream file: `rfdiffusion3/environment/Dockerfile` gains a `WHEELS_FROM=local` branch (installs an apex wheel compiled by
 `tools/rfd3_apex` instead of the published one).
 
-**Parallel input parsing** (`BOLTZ_PARSE_PROCS`, boltz2, default `min(8, usable CPUs)`). Parsing a pass's inputs — upstream's
+**Parallel input parsing** (`BOLTZ_PARSE_PROCS`, boltz2, default: every usable CPU (`sched_getaffinity`, so it follows a Slurm cpuset), capped at the input count). Parsing a pass's inputs — upstream's
 `check_inputs` + `process_inputs`, including RDKit conformer generation — was fully serial and overlapped nothing: 29 s of an 82 s
 100-record run. `prep.Zygote` serves one parse at a time by construction, so N zygotes are forked at the same pre-CUDA point and the
 inputs are spread over them, one thread per zygote. Every input is still parsed in a fresh child of a process that has parsed nothing,
