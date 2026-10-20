@@ -17,9 +17,13 @@ mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 out="${SIF_OUT:-$root/$kit.sif}"
 flags="${APPTAINER_BUILD_FLAGS---fakeroot}"
 [ -e "$out" ] && echo "note: $out exists and will be REPLACED (--force)"
-# --no-mount tmp,home: the kits' Dockerfiles write scratch files under /tmp (e.g. /tmp/pip.txt). Under Docker that is a private /tmp; under
-# Apptainer the HOST /tmp is mounted into %post, so on a shared login node such a path can already exist owned by another user and the build
-# fails with "Permission denied". Keeping /tmp and $HOME out of the build also makes it independent of whatever is in them.
+# A PRIVATE /tmp for the build: the kits' Dockerfiles write scratch files under /tmp (e.g. /tmp/pip.txt). Under Docker that is a private
+# /tmp; under Apptainer the HOST /tmp is mounted into %post, so on a shared login node such a path can already exist owned by another user
+# and the build dies with "Permission denied". `apptainer build` has no --no-mount, so bind an empty directory over /tmp instead.
+btmp="$APPTAINER_TMPDIR/buildtmp-$kit.$$"; mkdir -p "$btmp"
+trap 'rm -rf "$btmp"' EXIT
 echo "building $out from $kit/environment/apptainer.native.def (flags: ${flags:-none})"
 # shellcheck disable=SC2086
-exec apptainer build $flags --force --no-mount tmp,home --warn-unused-build-args "$@" "$out" "$kit/environment/apptainer.native.def"
+apptainer build $flags --force --bind "$btmp":/tmp --warn-unused-build-args "$@" "$out" "$kit/environment/apptainer.native.def"
+rc=$?
+exit $rc
