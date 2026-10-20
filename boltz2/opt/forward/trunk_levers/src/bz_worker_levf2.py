@@ -66,8 +66,12 @@ import warnings; warnings.filterwarnings("ignore", ".*that has Tensor Cores. To 
 # This runs BEFORE the first torch.cuda call on purpose: fork() from a CUDA-initialised process deadlocks the child, which is also why
 # worker_launch forks the first zygote at launch. Paths come from the batch json, not from the globals defined further down.
 PARSE_CACHE = {}
-PARSE_PROCS = max(1, int(os.environ.get("BOLTZ_PARSE_PROCS", "4") or 4))   # 4 by default: bit-identical outputs, ~4x less parse time;
-                                                                          # BOLTZ_PARSE_PROCS=1 restores the single-zygote serial parse
+try:                                                                      # the CPUs this process may actually use: Slurm's cpuset, not the node's
+    _NCPU = len(os.sched_getaffinity(0))
+except AttributeError:
+    _NCPU = os.cpu_count() or 1
+PARSE_PROCS = max(1, int(os.environ.get("BOLTZ_PARSE_PROCS", "") or min(8, _NCPU)))   # default min(8, usable CPUs): outputs are
+                                                                          # bit-identical either way; BOLTZ_PARSE_PROCS=1 restores the single-zygote serial parse
 if PARSE_PROCS > 1 and len(B["items"]) > 1:
     import concurrent.futures as _cf
     from boltz2_opt import prep as _prep0
