@@ -58,6 +58,40 @@ from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.models.boltz2 import Boltz2
 import warnings; warnings.filterwarnings("ignore", ".*that has Tensor Cores. To properly utilize them.*")
+# ---- parallel input parsing (BOLTZ_PARSE_PROCS=N, N>1) ------------------------------------------------------------------------------
+# Input parsing (check_inputs + process_inputs, incl. RDKit conformer generation) is otherwise fully serial, overlapping nothing.
+# prep.Zygote serves ONE parse at a time by construction (_serve forks a child and waits), so N zygotes are forked here and the parses are
+# spread over them, one thread per zygote (a Connection is not shared). Every input is still parsed in a FRESH child of a process that has
+# parsed nothing, so the RDKit conformer RNG property the single-zygote path relies on is unchanged.
+# This runs BEFORE the first torch.cuda call on purpose: fork() from a CUDA-initialised process deadlocks the child, which is also why
+# worker_launch forks the first zygote at launch. Paths come from the batch json, not from the globals defined further down.
+PARSE_CACHE = {}
+PARSE_PROCS = max(1, int(os.environ.get("BOLTZ_PARSE_PROCS", "1") or 1))
+if PARSE_PROCS > 1 and len(B["items"]) > 1:
+    import concurrent.futures as _cf
+    from boltz2_opt import prep as _prep0
+    _c = Path(B.get("cache", "/bw/boltz2")); _o = B.get("options") or {}; _out = Path(B["out_dir"])
+    _kw = dict(dict(use_msa_server=False, msa_server_url="https://api.colabfold.com", msa_pairing_strategy="greedy",
+                    preprocessing_threads=1, max_msa_seqs=8192), boltz2=True,
+               **{k: _o[k] for k in ("use_msa_server", "msa_server_url", "msa_pairing_strategy", "preprocessing_threads", "max_msa_seqs") if k in _o})
+    _n = min(PARSE_PROCS, len(B["items"]))
+    _zyg = [_prep0.zygote() for _ in range(_n)]
+    for _z in _zyg:                                     # fork them all HERE: single-threaded, and before any CUDA context exists
+        _z.start("parse_pool")
+    _t0 = time.time()
+    def _parse_one_pooled(args):
+        zy, it = args
+        data = Path(it["yaml"]); od = _out / f"boltz_results_{data.stem}"; od.mkdir(parents=True, exist_ok=True)
+        t = time.time()
+        return it["yaml"], zy.parse(str(data), str(od), str(_c / "ccd.pkl"), str(_c / "mols"), **_kw), round(time.time() - t, 3)
+    with _cf.ThreadPoolExecutor(_n) as _ex:
+        for _y, _res, _dt in _ex.map(_parse_one_pooled, [(_zyg[i % _n], it) for i, it in enumerate(B["items"])]):
+            PARSE_CACHE[_y] = (_res, _dt)
+    for _z in _zyg:
+        _z.close()
+    LOG["env"]["parse_procs"] = {"requested": PARSE_PROCS, "zygotes": _n, "items": len(B["items"]), "wall_s": round(time.time() - _t0, 2)}
+    print(f"[boltz2-opt] PARSE parallel: {len(PARSE_CACHE)} input(s) over {_n} zygote(s) in {LOG['env']['parse_procs']['wall_s']}s", flush=True)
+
 ev("imports_done", torch=torch.__version__, device=torch.cuda.get_device_name(0))
 # ---- BOLTZ-2 TRUNK levers (inert unless BOLTZ_LEVERS is set; stock bytes otherwise) ----
 sys.path.insert(0, os.environ.get("BOLTZ_OPT_WORKDIR") or os.getcwd()); import boltz_trunk_levers as _LEV; LOG["env"]["boltz_levers"] = list(_LEV.apply()); ev("levers", levers=LOG["env"]["boltz_levers"])
@@ -108,34 +142,6 @@ from boltz2_opt import prep as _prep, skipped as SK, writer as WR   # prep: the 
 PREP = _prep.zygote(); LOG["env"]["prep"] = PREP.describe()
 PROCESS_INPUTS_KW = dict(dict(use_msa_server=False, msa_server_url="https://api.colabfold.com", msa_pairing_strategy="greedy", preprocessing_threads=1, max_msa_seqs=8192), boltz2=True,
                          **{k: OPTS[k] for k in ("use_msa_server", "msa_server_url", "msa_pairing_strategy", "preprocessing_threads", "max_msa_seqs") if k in OPTS})   # main.py predict()'s arguments to process_inputs: the CLI defaults, or the caller's --use_msa_server / --msa_server_url / --msa_pairing_strategy / --preprocessing-threads / --max_msa_seqs
-# ---- parallel input parsing (BOLTZ_PARSE_PROCS=N, N>1): the zygote serves ONE parse at a time by construction (prep.Zygote._serve forks a
-# child and waits), so N-1 EXTRA zygotes are forked here — still before CUDA and before any lever, each still forking a fresh child per input,
-# so every input is parsed exactly as the single-zygote path parses it (same RDKit conformer RNG property). Each thread owns one zygote, so no
-# connection is shared. The parses are independent; only this loop's serialisation is removed. N=1 (the default) keeps the single zygote.
-PARSE_PROCS = max(1, int(os.environ.get("BOLTZ_PARSE_PROCS", "1") or 1))
-PARSE_CACHE = {}
-if PARSE_PROCS > 1 and len(B["items"]) > 1:
-    import concurrent.futures as _cf
-    _zyg = [PREP] + [_prep.zygote() for _ in range(min(PARSE_PROCS, len(B["items"])) - 1)]
-    for _z in _zyg:                                    # fork every zygote HERE, while this process is still single-threaded:
-        _z.start("parse_pool")                         # os.fork() from a worker thread can deadlock the child on a lock held by another thread
-    LOG["env"]["parse_procs"] = {"requested": PARSE_PROCS, "zygotes": len(_zyg), "items": len(B["items"])}
-    ev("parse_parallel_start", **LOG["env"]["parse_procs"])
-    _t0 = time.time()
-    def _one(args):
-        zy, it = args
-        data = Path(it["yaml"]); od = OUT / f"boltz_results_{data.stem}"; od.mkdir(parents=True, exist_ok=True)
-        t = time.time()
-        return it["yaml"], zy.parse(str(data), str(od), str(ccd_path), str(mol_dir), **PROCESS_INPUTS_KW), round(time.time() - t, 3)
-    _jobs = [(_zyg[i % len(_zyg)], it) for i, it in enumerate(B["items"])]
-    with _cf.ThreadPoolExecutor(len(_zyg)) as _ex:
-        for _y, _res, _dt in _ex.map(_one, _jobs):
-            PARSE_CACHE[_y] = (_res, _dt)
-    LOG["env"]["parse_parallel_s"] = round(time.time() - _t0, 2)
-    ev("parse_parallel_done", s=LOG["env"]["parse_parallel_s"], parsed=len(PARSE_CACHE))
-    for _z in _zyg[1:]:
-        _z.close()
-
 def process_item(it):
     """exactly main.py: out_dir/boltz_results_<stem>/processed/...; one yaml per dir (single-design semantics), parsed in a fresh child of the zygote
     (PREP.parse: check_inputs + process_inputs; its stdout / stderr land in this transcript verbatim). Returns (out_dir, processed, process_inputs_s,
@@ -144,7 +150,7 @@ def process_item(it):
     '[boltz2-opt] SKIPPED item=<name> reason=...' line, a `skipped` entry in the log) and never reaches a DataLoader or predict_step."""
     data = Path(it["yaml"]); out_dir = OUT / f"boltz_results_{data.stem}"; out_dir.mkdir(parents=True, exist_ok=True)
     t = time.time()
-    if it["yaml"] in PARSE_CACHE:                      # parsed already, in parallel, above (BOLTZ_PARSE_PROCS > 1): same child, same result
+    if it["yaml"] in PARSE_CACHE:                      # already parsed above, in parallel, in a fresh child exactly as this call would
         res, _dt = PARSE_CACHE.pop(it["yaml"]); t = time.time() - _dt
     else:
         res = PREP.parse(str(data), str(out_dir), str(ccd_path), str(mol_dir), **PROCESS_INPUTS_KW)
