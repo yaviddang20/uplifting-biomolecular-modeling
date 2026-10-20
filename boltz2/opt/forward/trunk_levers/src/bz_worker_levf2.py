@@ -117,6 +117,8 @@ PARSE_CACHE = {}
 if PARSE_PROCS > 1 and len(B["items"]) > 1:
     import concurrent.futures as _cf
     _zyg = [PREP] + [_prep.zygote() for _ in range(min(PARSE_PROCS, len(B["items"])) - 1)]
+    for _z in _zyg:                                    # fork every zygote HERE, while this process is still single-threaded:
+        _z.start("parse_pool")                         # os.fork() from a worker thread can deadlock the child on a lock held by another thread
     LOG["env"]["parse_procs"] = {"requested": PARSE_PROCS, "zygotes": len(_zyg), "items": len(B["items"])}
     ev("parse_parallel_start", **LOG["env"]["parse_procs"])
     _t0 = time.time()
