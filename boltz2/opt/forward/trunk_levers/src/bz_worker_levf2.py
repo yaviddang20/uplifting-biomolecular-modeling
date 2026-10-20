@@ -84,14 +84,25 @@ if PARSE_PROCS > 1 and len(B["items"]) > 1:
         zy, it = args
         data = Path(it["yaml"]); od = _out / f"boltz_results_{data.stem}"; od.mkdir(parents=True, exist_ok=True)
         t = time.time()
-        return it["yaml"], zy.parse(str(data), str(od), str(_c / "ccd.pkl"), str(_c / "mols"), **_kw), round(time.time() - t, 3)
+        try:                                            # best effort: a pool zygote that dies (it is one more process on a shared node)
+            res = zy.parse(str(data), str(od), str(_c / "ccd.pkl"), str(_c / "mols"), **_kw)
+        except Exception as e:                          # leaves this input unparsed, and process_item then parses it on PREP as usual
+            return it["yaml"], None, f"{type(e).__name__}: {e}"
+        return it["yaml"], (res, round(time.time() - t, 3)), None
+    _lost = []
     with _cf.ThreadPoolExecutor(_n) as _ex:
-        for _y, _res, _dt in _ex.map(_parse_one_pooled, [(_zyg[i % _n], it) for i, it in enumerate(B["items"])]):
-            PARSE_CACHE[_y] = (_res, _dt)
+        for _y, _got, _why in _ex.map(_parse_one_pooled, [(_zyg[i % _n], it) for i, it in enumerate(B["items"])]):
+            if _got is None:
+                _lost.append((_y, _why))
+            else:
+                PARSE_CACHE[_y] = _got
     for _z in _zyg:
-        _z.close()
-    LOG["env"]["parse_procs"] = {"requested": PARSE_PROCS, "zygotes": _n, "items": len(B["items"]), "wall_s": round(time.time() - _t0, 2)}
-    print(f"[boltz2-opt] PARSE parallel: {len(PARSE_CACHE)} input(s) over {_n} zygote(s) in {LOG['env']['parse_procs']['wall_s']}s", flush=True)
+        try: _z.close()
+        except Exception: pass
+    LOG["env"]["parse_procs"] = {"requested": PARSE_PROCS, "zygotes": _n, "items": len(B["items"]), "parsed": len(PARSE_CACHE),
+                                 "fell_back": len(_lost), "wall_s": round(time.time() - _t0, 2)}
+    print(f"[boltz2-opt] PARSE parallel: {len(PARSE_CACHE)}/{len(B['items'])} input(s) over {_n} zygote(s) in "
+          f"{LOG['env']['parse_procs']['wall_s']}s" + (f"; {len(_lost)} fell back to the single zygote ({_lost[0][1][:90]})" if _lost else ""), flush=True)
 
 ev("imports_done", torch=torch.__version__, device=torch.cuda.get_device_name(0))
 # ---- BOLTZ-2 TRUNK levers (inert unless BOLTZ_LEVERS is set; stock bytes otherwise) ----
