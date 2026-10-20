@@ -80,22 +80,23 @@ if PARSE_PROCS > 1 and len(B["items"]) > 1:
     for _z in _zyg:                                     # fork them all HERE: single-threaded, and before any CUDA context exists
         _z.start("parse_pool")
     _t0 = time.time()
-    def _parse_one_pooled(args):
-        zy, it = args
-        data = Path(it["yaml"]); od = _out / f"boltz_results_{data.stem}"; od.mkdir(parents=True, exist_ok=True)
-        t = time.time()
-        try:                                            # best effort: a pool zygote that dies (it is one more process on a shared node)
-            res = zy.parse(str(data), str(od), str(_c / "ccd.pkl"), str(_c / "mols"), **_kw)
-        except Exception as e:                          # leaves this input unparsed, and process_item then parses it on PREP as usual
-            return it["yaml"], None, f"{type(e).__name__}: {e}"
-        return it["yaml"], (res, round(time.time() - t, 3)), None
+    def _parse_slice(k):
+        """Zygote k parses items[k::n] one at a time. ONE task per zygote: Zygote.run is a single request/response over one
+        Connection, so two threads must never share one (ThreadPoolExecutor.map hands a job to whichever thread is free, which
+        is why pairing jobs to zygotes by index does not hold)."""
+        zy, done, lost = _zyg[k], {}, []
+        for it in B["items"][k::_n]:
+            data = Path(it["yaml"]); od = _out / f"boltz_results_{data.stem}"; od.mkdir(parents=True, exist_ok=True)
+            t = time.time()
+            try:                                        # best effort: a pool zygote that dies leaves its remaining inputs to PREP
+                done[it["yaml"]] = (zy.parse(str(data), str(od), str(_c / "ccd.pkl"), str(_c / "mols"), **_kw), round(time.time() - t, 3))
+            except Exception as e:
+                lost.append((it["yaml"], f"{type(e).__name__}: {e}"))
+        return done, lost
     _lost = []
     with _cf.ThreadPoolExecutor(_n) as _ex:
-        for _y, _got, _why in _ex.map(_parse_one_pooled, [(_zyg[i % _n], it) for i, it in enumerate(B["items"])]):
-            if _got is None:
-                _lost.append((_y, _why))
-            else:
-                PARSE_CACHE[_y] = _got
+        for _done, _l in _ex.map(_parse_slice, range(_n)):
+            PARSE_CACHE.update(_done); _lost.extend(_l)
     for _z in _zyg:
         try: _z.close()
         except Exception: pass
