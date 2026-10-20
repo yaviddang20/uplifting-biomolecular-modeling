@@ -75,7 +75,8 @@ if PARSE_PROCS > 1 and len(B["items"]) > 1:
                     preprocessing_threads=1, max_msa_seqs=8192), boltz2=True,
                **{k: _o[k] for k in ("use_msa_server", "msa_server_url", "msa_pairing_strategy", "preprocessing_threads", "max_msa_seqs") if k in _o})
     _n = min(PARSE_PROCS, len(B["items"]))
-    _zyg = [_prep0.zygote() for _ in range(_n)]
+    _zyg = [_prep0.Zygote() for _ in range(_n)]     # the CLASS, not prep.zygote(): that returns one process-wide singleton, and N
+                                                    # threads sharing a single Connection deadlock
     for _z in _zyg:                                     # fork them all HERE: single-threaded, and before any CUDA context exists
         _z.start("parse_pool")
     _t0 = time.time()
