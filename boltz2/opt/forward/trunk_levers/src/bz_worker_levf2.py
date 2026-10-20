@@ -93,7 +93,7 @@ if PARSE_PROCS > 1 and len(B["items"]) > 1:
         for it in B["items"][k::_n]:
             data = Path(it["yaml"]); od = _out / f"boltz_results_{data.stem}"; od.mkdir(parents=True, exist_ok=True)
             t = time.time()
-            try:                                        # best effort: a pool zygote that dies leaves its remaining inputs to PREP
+            try:                                        # best effort: if a pool zygote dies its remaining inputs fall back to PREP
                 done[it["yaml"]] = (zy.parse(str(data), str(od), str(_c / "ccd.pkl"), str(_c / "mols"), **_kw), round(time.time() - t, 3))
             except Exception as e:
                 lost.append((it["yaml"], f"{type(e).__name__}: {e}"))
