@@ -5,8 +5,11 @@ Source: https://github.com/anthropics/uplifting-biomolecular-modeling (+ our pat
 
 ## Where things are
 
+Paths below are `daviyang`'s scratch. On another account substitute your own base everywhere — see
+[Setting up on your own account](#setting-up-on-your-own-account); `kits.sh` works out the base itself.
+
 ```
-/mnt/scratch/user/daviyang/
+/mnt/scratch/user/daviyang/            <- $KIT_BASE
 ├── uplifting-biomolecular-modeling/     the repo
 │   ├── boltz2.sif                       Boltz-2 container
 │   ├── af3_torch.sif                    AF3 (xfold on OpenFold3-preview2 weights) container
@@ -44,6 +47,50 @@ source /mnt/scratch/user/daviyang/uplifting-biomolecular-modeling/kits.sh
 
 Each one is shorthand for `apptainer run --nv --bind <weights> --bind <outputs> --bind /mnt/scratch/user/daviyang <kit>.sif ...`.
 See the full expansion with `type boltz2_kit`. Inside the container, `out/...` = `kit_out/<kit>/out/...` on the cluster.
+
+## Setting up on your own account
+
+Scratch directories are mode `700`, so you cannot read someone else's containers or weights — you need your own clone,
+your own `.sif` files and your own copy of the weights (~29 GB for all five). One-time setup, on the **login node**
+(it has internet; compute nodes do not):
+
+```bash
+# 1. Pick a base. Everything below lives under it. kits.sh defaults KIT_BASE to the repo's parent
+#    directory, so if you clone into this base you never have to set it.
+export KIT_BASE=/mnt/scratch/user/<your-id>
+mkdir -p "$KIT_BASE"
+cd "$KIT_BASE"
+
+# 2. Clone the fork (has the Apptainer-only build; upstream needs Docker, which CoreHPC does not have).
+git clone https://github.com/yaviddang20/uplifting-biomolecular-modeling.git
+cd uplifting-biomolecular-modeling
+
+# 3. Build the containers you want. One at a time; each takes 20-60 min and needs ~30 GB free in
+#    $APPTAINER_TMPDIR (build_sif.sh points cache and tmp at $SCRATCH by default).
+bash tools/build_sif.sh boltz2
+# also available: af3_torch boltzgen complexa rfdiffusion3 proteinmpnn
+
+# 4. Load the shortcuts and install the weights for each kit you built. The --weights path is the
+#    path INSIDE the container; kits.sh binds $KIT_BASE/weights/<kit> there for you.
+source kits.sh          # creates $KIT_BASE/weights and $KIT_BASE/kit_out
+boltz2_kit install --weights /weights/boltz2
+```
+
+The per-kit install commands are listed under [Rebuilding a container](#rebuilding-a-container) — they differ a little
+(`af3_kit` needs `--fetch`, complexa uses `complexa_weights`). All five together are ~29 GB. The download is CPU- and
+network-heavy, and `af3_torch`'s weight conversion gets throttled to a crawl by the login node's per-user memory cap,
+so run that one as a job (`sbatch -p cpu`) rather than on the login node.
+
+Then check it on a GPU node and you are done:
+
+```bash
+srun -p gpu --gres=gpu:nvidia_h100_nvl:1 -c 8 --mem=64G -t 0:30:00 --pty bash
+source "$KIT_BASE/uplifting-biomolecular-modeling/kits.sh"
+boltz2_kit check --config h100 --mode fast     # expect: ACTIVE mode=fast
+```
+
+Put `export KIT_BASE=/mnt/scratch/user/<your-id>` in your `~/.bashrc.d/` if your clone is not directly under the base,
+and read the rest of this file with `/mnt/scratch/user/daviyang` replaced by your base throughout.
 
 ## Rules for this cluster
 

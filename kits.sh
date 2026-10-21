@@ -1,6 +1,12 @@
 # Shortcuts for the kit images. Load with:  source <repo>/kits.sh   (UCSF CoreHPC default paths; set KIT_BASE elsewhere)
 # Each function = the README's route-B `kit` for that kit:  boltz2_kit <command> ...   /   af3_kit <command> ...
-KIT_BASE="${KIT_BASE:-/mnt/scratch/user/daviyang}"   # where the repo, weights/ and kit_out/ live; export KIT_BASE to relocate
+# Where the repo, weights/ and kit_out/ live. Defaults to the PARENT of the directory holding this file, i.e. the layout
+#   <base>/uplifting-biomolecular-modeling/   (this checkout, with the .sif files)
+#   <base>/weights/<kit>/                     (model weights, filled by `<kit>_kit install --weights ...`)
+#   <base>/kit_out/<kit>/                     (outputs and compile caches; created below)
+# Export KIT_BASE before sourcing this file to put them somewhere else.
+_kits_self="${BASH_SOURCE[0]:-$0}"
+KIT_BASE="${KIT_BASE:-$(cd "$(dirname "$(cd "$(dirname "$_kits_self")" && pwd)")" && pwd)}"
 KITS="$KIT_BASE/uplifting-biomolecular-modeling"
 KITW="$KIT_BASE/weights"          # model weights, one sub-folder per kit
 KITO="$KIT_BASE/kit_out"          # outputs + compile caches, one sub-folder per kit
