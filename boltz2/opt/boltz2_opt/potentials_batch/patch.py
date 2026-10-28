@@ -112,3 +112,56 @@ def apply():
         if cls is not None and "compute_args" in cls.__dict__:
             cls.compute_args = _batched_compute_args(cls, cls.__dict__["compute_args"])
     return [n for n in _PAIR_POTENTIALS if getattr(P, n, None) is not None]
+
+
+# ---------------------------------------------------------------- sampler ---
+# AtomDiffusion.sample() sizes its steering buffers with `multiplicity`, which
+# is the per-record sample count. The real leading axis is batch * multiplicity
+# (atom_mask is repeat_interleave'd). At B=1 they coincide; at B>1 every one of
+# these is short by a factor of B. Patched by source rewrite rather than a hand
+# copy, so an upstream change to the body shows up as a failed substitution
+# instead of silently stale code.
+import inspect
+import textwrap
+
+_SAMPLE_SUBS = [
+    ("energy_traj = torch.empty((multiplicity, 0), device=self.device)",
+     "energy_traj = torch.empty((_Bsz * multiplicity, 0), device=self.device)"),
+    ("resample_weights = torch.ones(multiplicity, device=self.device).reshape(",
+     "resample_weights = torch.ones(_Bsz * multiplicity, device=self.device).reshape("),
+    ("(multiplicity, *atom_mask.shape[1:], 3),",
+     "(_Bsz * multiplicity, *atom_mask.shape[1:], 3),"),
+    ("max_parallel_samples = multiplicity",
+     "max_parallel_samples = _Bsz * multiplicity"),
+    ("multiplicity, device=atom_coords.device, dtype=atom_coords.dtype",
+     "_Bsz * multiplicity, device=atom_coords.device, dtype=atom_coords.dtype"),
+    ("sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)",
+     "sample_ids = torch.arange(_Bsz * multiplicity).to(atom_coords_noisy.device)"),
+    ("multiplicity % max_parallel_samples + 1",
+     "(_Bsz * multiplicity) % max_parallel_samples + 1"),
+    ("multiplicity=sample_ids_chunk.numel(),",
+     "multiplicity=sample_ids_chunk.numel() // _Bsz,"),
+    ("energy = torch.zeros(multiplicity, device=self.device)",
+     "energy = torch.zeros(_Bsz * multiplicity, device=self.device)"),
+]
+
+
+def patch_sampler():
+    from boltz.model.modules import diffusionv2 as D
+
+    src = textwrap.dedent(inspect.getsource(D.AtomDiffusion.sample))
+    missing = [a for a, _ in _SAMPLE_SUBS if a not in src]
+    if missing:
+        raise RuntimeError(f"sample() source changed; no match for: {missing}")
+    for a, b in _SAMPLE_SUBS:
+        src = src.replace(a, b)
+
+    # capture the pre-expansion batch size before atom_mask is repeat_interleave'd
+    anchor = "    if steering_args is not None and ("      # dedented to module level
+    assert anchor in src, "sample() prologue changed"
+    src = src.replace(anchor, "    _Bsz = atom_mask.shape[0]\n" + anchor, 1)
+
+    ns = dict(D.__dict__)
+    exec(compile(src, "<batched_sample>", "exec"), ns)
+    D.AtomDiffusion.sample = ns["sample"]
+    return len(_SAMPLE_SUBS)

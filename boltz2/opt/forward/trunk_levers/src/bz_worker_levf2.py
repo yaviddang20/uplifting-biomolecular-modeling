@@ -105,6 +105,10 @@ def stock_model_kwargs():
 # parsing zygote per input (prep.py) — the process context `boltz predict <one yaml>` parses in: RDKit's conformer RNG is process-global and unseeded upstream,
 # so only a process that has embedded nothing before hands a SMILES ligand the conformer stock hands it ----------------
 from boltz2_opt import prep as _prep, skipped as SK, writer as WR   # prep: the parsing zygote (worker_launch forks it before CUDA / hooks); skipped: inputs the stock parser skips, named on one SKIPPED line; writer: the output writer off the critical path (registry writer_overlap, BOLTZ_WRITER=overlap, attached by worker_launch) — when it is not installed every WR call below is the stock statement it stands beside
+BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS") == "1"   # batch-aware steering potentials: lets --use_potentials inputs share a batch
+if BATCH_POT:
+    from boltz2_opt.potentials_batch import patch as _POTB
+    LOG['env']['potentials_batch'] = {'potentials': _POTB.apply(), 'sampler_subs': _POTB.patch_sampler()}
 PREP = _prep.zygote(); LOG["env"]["prep"] = PREP.describe()
 PROCESS_INPUTS_KW = dict(dict(use_msa_server=False, msa_server_url="https://api.colabfold.com", msa_pairing_strategy="greedy", preprocessing_threads=1, max_msa_seqs=8192), boltz2=True,
                          **{k: OPTS[k] for k in ("use_msa_server", "msa_server_url", "msa_pairing_strategy", "preprocessing_threads", "max_msa_seqs") if k in OPTS})   # main.py predict()'s arguments to process_inputs: the CLI defaults, or the caller's --use_msa_server / --msa_server_url / --msa_pairing_strategy / --preprocessing-threads / --max_msa_seqs
@@ -304,7 +308,7 @@ if args.pipeline and BATCH_N > 1:
         UNITS.append({"name": it["name"], "it": it, "out_dir": out_dir, "processed": processed, "t_proc": t_proc, "manifest": processed.manifest,
                       "targets_dir": processed.targets_dir, "msa_dir": processed.msa_dir, "constraints_dir": processed.constraints_dir,
                       "template_dir": processed.template_dir, "extra_mols_dir": processed.extra_mols_dir, "ntok": BT.n_tokens_hint(rec),
-                      "alone": bool(rec.affinity) or guided or SMOD is None})   # upstream's affinity leg and per-step steering / guidance are single-record
+                      "alone": bool(rec.affinity) or (guided and not BATCH_POT) or SMOD is None})   # upstream's affinity leg and per-step steering / guidance are single-record
     BID = [0]
     def write_group(pred, singles, recs, idxs, s, t_pred, digs, bid, conf):
         n = len(idxs)
