@@ -224,6 +224,24 @@ class _Noise:
         return torch.cat(Rs), torch.cat(trs)
 
 
+_DBG = {"n": 0}
+
+
+def _mult(Bsz, multiplicity, chunk_n, ids=None, maxpar=None):
+    """Per-record multiplicity for the network, with a one-shot trace."""
+    if chunk_n != Bsz * multiplicity:
+        raise RuntimeError(
+            f"chunk spans {chunk_n} of {Bsz * multiplicity} rows: a partial chunk "
+            f"mismatches records with their conditioning at B={Bsz}")
+    if _DBG["n"] < 4:
+        _DBG["n"] += 1
+        print(f"[POTB] _Bsz={Bsz} multiplicity={multiplicity} chunk_n={chunk_n} "
+              f"max_parallel={maxpar} total_rows={Bsz * multiplicity} "
+              f"ids={None if ids is None else ids.tolist()} "
+              f"-> per_record={chunk_n // Bsz}", flush=True)
+    return chunk_n // Bsz
+
+
 def _begin(B, device):
     """Called at the top of each sample(); None => fall back to stock draws."""
     seeds = BATCH.get("seeds")
@@ -264,6 +282,14 @@ _SAMPLE_SUBS = [
      "resample_weights = torch.ones(_Bsz * multiplicity, device=self.device).reshape("),
     ("(multiplicity, *atom_mask.shape[1:], 3),",
      "(_Bsz * multiplicity, *atom_mask.shape[1:], 3),"),
+    # upstream chunks sample_ids into pieces of <= max_parallel_samples and tells
+    # the network multiplicity=chunk_size. That is sound at B=1, where every row is
+    # a sample of the SAME record. At B>1 the rows span records while `feats` -- the
+    # conditioning -- always covers all B of them and is never sliced to match, so a
+    # partial chunk hands row i record i's conditioning: silently wrong, and no shape
+    # error to catch it. Force one chunk over the whole leading axis.
+    ("if max_parallel_samples is None:",
+     "if max_parallel_samples is None or _Bsz > 1:"),
     ("max_parallel_samples = multiplicity",
      "max_parallel_samples = _Bsz * multiplicity"),
     ("multiplicity, device=atom_coords.device, dtype=atom_coords.dtype",
@@ -273,7 +299,7 @@ _SAMPLE_SUBS = [
     ("multiplicity % max_parallel_samples + 1",
      "(_Bsz * multiplicity) % max_parallel_samples + 1"),
     ("multiplicity=sample_ids_chunk.numel(),",
-     "multiplicity=sample_ids_chunk.numel() // _Bsz,"),
+     "multiplicity=_POTB_MULT(_Bsz, multiplicity, sample_ids_chunk.numel(), sample_ids_chunk, max_parallel_samples),"),
     ("energy = torch.zeros(multiplicity, device=self.device)",
      "energy = torch.zeros(_Bsz * multiplicity, device=self.device)"),
     ("atom_coords = init_sigma * torch.randn(shape, device=self.device)",
@@ -310,6 +336,7 @@ def patch_sampler():
 
     ns = D.__dict__
     ns["_POTB_BEGIN"] = _begin
+    ns["_POTB_MULT"] = _mult
     exec(compile(src, "<batched_sample>", "exec"), ns)
     D.AtomDiffusion.sample = ns.pop("sample")
     return len(_SAMPLE_SUBS)
