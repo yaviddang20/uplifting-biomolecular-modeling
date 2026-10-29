@@ -26,6 +26,20 @@ def _batched_compute_args(cls, orig):
             self._pair_record, self._B = None, 1
             return orig(self, feats, parameters)
 
+        # compute_args runs on every compute()/compute_gradient() -- ~20 guidance
+        # steps x ~200 denoising steps. The result depends only on feats and the
+        # parameter values, both constant across a guidance loop, so memoise it;
+        # rebuilding per-record topology that often is most of the batched cost.
+        try:
+            key = (id(feats), tuple(sorted((k, float(v)) for k, v in parameters.items()
+                                           if isinstance(v, (int, float, bool)))))
+        except Exception:
+            key = None
+        hit = getattr(self, "_args_cache", None)
+        if key is not None and hit is not None and hit[0] == key:
+            self._pair_record, self._B = hit[1], B
+            return hit[2]
+
         idx, argcols, recs = [], [], []
         for b in range(B):
             sub = {k: (v[b : b + 1] if torch.is_tensor(v) else v)
@@ -45,15 +59,31 @@ def _batched_compute_args(cls, orig):
         # flat-bottom potential): concatenate per position, keep None as None.
         cat_args = tuple(None if col[0] is None else torch.cat(col)
                          for col in zip(*argcols))
-        return torch.cat(idx, dim=1), cat_args, None, None, None
+        out = (torch.cat(idx, dim=1), cat_args, None, None, None)
+        if key is not None:
+            self._args_cache = (key, self._pair_record, out)
+        return out
 
     return compute_args
+
+
+def _guard(self, feats):
+    """A potential this patch does not batch must NOT quietly run upstream's
+    record-0 code on a B>1 batch: that is the silent corruption this whole
+    change exists to remove. Raise instead, and the kit's own fallback re-runs
+    the group one record per step -- slow, but right."""
+    B = feats["atom_pad_mask"].shape[0]
+    if B > 1 and getattr(self, "_pair_record", None) is None:
+        raise NotImplementedError(
+            f"{type(self).__name__} is not batch-aware (B={B}); refusing to score "
+            f"records 1.. with record 0 topology")
 
 
 _orig_compute = P.Potential.compute
 
 
 def _compute(self, coords, feats, parameters):
+    _guard(self, feats)
     index, args, com, ref, op = self.compute_args(feats, parameters)
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
@@ -76,6 +106,7 @@ _orig_grad = P.Potential.compute_gradient
 
 
 def _compute_gradient(self, coords, feats, parameters):
+    _guard(self, feats)
     index, args, com, ref, op = self.compute_args(feats, parameters)
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
