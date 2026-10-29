@@ -67,23 +67,59 @@ def _batched_compute_args(cls, orig):
     return compute_args
 
 
-def _guard(self, feats):
+def _guard(self, feats, parameters):
     """A potential this patch does not batch must NOT quietly run upstream's
     record-0 code on a B>1 batch: that is the silent corruption this whole
-    change exists to remove. Raise instead, and the kit's own fallback re-runs
-    the group one record per step -- slow, but right."""
+    change exists to remove.
+
+    But an unbatched potential that has no work contributes nothing, so it is
+    safe to skip: TemplateReferencePotential without templates, ContactPotentital
+    without contact restraints and SymmetricChainCOMPotential without symmetric
+    chains all return an empty index, which is exactly NISE's input shape (one
+    protein, one ligand, no templates or constraints). Check every record, not
+    just record 0 -- emptiness is per record. Otherwise raise, and the kit's own
+    fallback re-runs the group one record per step: slow, but right.
+
+    Returns True when the potential contributes nothing and may be skipped.
+    """
     B = feats["atom_pad_mask"].shape[0]
-    if B > 1 and getattr(self, "_pair_record", None) is None:
-        raise NotImplementedError(
-            f"{type(self).__name__} is not batch-aware (B={B}); refusing to score "
-            f"records 1.. with record 0 topology")
+    if B == 1 or getattr(type(self), "_potb_batched", False):
+        return False
+
+    key = id(feats)
+    cached = getattr(self, "_inactive_for", None)
+    if cached is not None and cached[0] == key:
+        if cached[1]:
+            return True
+        raise NotImplementedError(cached[2])
+
+    orig = type(self).compute_args
+    empty = True
+    for b in range(B):
+        sub = {k: (v[b : b + 1] if torch.is_tensor(v) else v) for k, v in feats.items()}
+        try:
+            index = orig(self, sub, parameters)[0]
+        except Exception:
+            empty = False
+            break
+        if index is not None and index.shape[-1] != 0:
+            empty = False
+            break
+
+    msg = (f"{type(self).__name__} is not batch-aware and has work (B={B}); "
+           f"refusing to score records 1.. with record 0 topology")
+    self._inactive_for = (key, empty, msg)
+    if empty:
+        return True
+    raise NotImplementedError(msg)
 
 
 _orig_compute = P.Potential.compute
 
 
 def _compute(self, coords, feats, parameters):
-    _guard(self, feats)
+    if _guard(self, feats, parameters):
+        return torch.zeros(coords.shape[:-2], device=coords.device)
     index, args, com, ref, op = self.compute_args(feats, parameters)
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
@@ -106,7 +142,8 @@ _orig_grad = P.Potential.compute_gradient
 
 
 def _compute_gradient(self, coords, feats, parameters):
-    _guard(self, feats)
+    if _guard(self, feats, parameters):
+        return torch.zeros_like(coords)
     index, args, com, ref, op = self.compute_args(feats, parameters)
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
@@ -141,6 +178,7 @@ def apply():
         cls = getattr(P, name, None)
         if cls is not None and "compute_args" in cls.__dict__:
             cls.compute_args = _batched_compute_args(cls, cls.__dict__["compute_args"])
+            cls._potb_batched = True
     return [n for n in _PAIR_POTENTIALS if getattr(P, n, None) is not None]
 
 
