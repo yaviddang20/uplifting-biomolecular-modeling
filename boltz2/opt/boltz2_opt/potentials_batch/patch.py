@@ -26,7 +26,7 @@ def _batched_compute_args(cls, orig):
             self._pair_record, self._B = None, 1
             return orig(self, feats, parameters)
 
-        idx, ks, los, his, recs = [], [], [], [], []
+        idx, argcols, recs = [], [], []
         for b in range(B):
             sub = {k: (v[b : b + 1] if torch.is_tensor(v) else v)
                    for k, v in feats.items()}
@@ -34,19 +34,18 @@ def _batched_compute_args(cls, orig):
             if com is not None or ref is not None or op is not None:
                 raise NotImplementedError(
                     f"{cls.__name__}: com/ref/operator args not batched yet")
-            k, lo, hi = args
             idx.append(index)
-            ks.append(k)
-            los.append(lo)
-            his.append(hi)
+            argcols.append(args)
             recs.append(torch.full((index.shape[1],), b, dtype=torch.long,
                                    device=index.device))
 
         self._pair_record = torch.cat(recs)
         self._B = B
-        hi_cat = None if his[0] is None else torch.cat(his)
-        return (torch.cat(idx, dim=1), (torch.cat(ks), torch.cat(los), hi_cat),
-                None, None, None)
+        # args differ in arity and any element may be None (an unbounded side of a
+        # flat-bottom potential): concatenate per position, keep None as None.
+        cat_args = tuple(None if col[0] is None else torch.cat(col)
+                         for col in zip(*argcols))
+        return torch.cat(idx, dim=1), cat_args, None, None, None
 
     return compute_args
 
@@ -114,6 +113,71 @@ def apply():
     return [n for n in _PAIR_POTENTIALS if getattr(P, n, None) is not None]
 
 
+# ------------------------------------------------------------- noise carrier ---
+# Upstream's eager sample() draws its randomness from one stream over the whole
+# leading axis, so with B>1 a record's trajectory would depend on its batch-mates.
+# bz_sampler (the rollout lever) solves this by pre-drawing per record, but
+# potentials drop that lever. Same idea here, for the eager path: one generator
+# per record, every draw sliced per record. Seeds come from the batched worker
+# loop, exactly as bz_sampler.BATCH["seeds"] does.
+BATCH = {"seeds": None}
+_ACTIVE = {"noise": None}
+
+
+class _Noise:
+    def __init__(self, B, device, seeds):
+        self.B, self.device = B, device
+        self.gens = []
+        for b in range(B):
+            g = torch.Generator(device=device)
+            g.manual_seed(int(seeds[b]) % (2 ** 63 - 1))
+            self.gens.append(g)
+
+    def randn(self, shape, dtype=torch.float32):
+        m = shape[0] // self.B
+        out = torch.empty(shape, device=self.device, dtype=dtype)
+        for b, g in enumerate(self.gens):
+            out[b * m : (b + 1) * m] = torch.randn(
+                (m, *shape[1:]), device=self.device, dtype=dtype, generator=g)
+        return out
+
+    def augment(self, n, s_trans, dtype):
+        from boltz.model.modules.utils import _copysign, quaternion_to_matrix
+        m = n // self.B
+        Rs, trs = [], []
+        for g in self.gens:
+            o = torch.randn((m, 4), dtype=dtype, device=self.device, generator=g)
+            s = (o * o).sum(1)
+            o = o / _copysign(torch.sqrt(s), o[:, 0])[:, None]
+            Rs.append(quaternion_to_matrix(o))
+            trs.append(torch.randn((m, 1, 3), dtype=dtype, device=self.device,
+                                   generator=g) * s_trans)
+        return torch.cat(Rs), torch.cat(trs)
+
+
+def _begin(B, device):
+    """Called at the top of each sample(); None => fall back to stock draws."""
+    seeds = BATCH.get("seeds")
+    if B == 1 and not seeds:
+        _ACTIVE["noise"] = None
+        return None
+    if not seeds or len(seeds) != B:
+        seeds = [int(x) for x in torch.randint(0, 2 ** 62, (B,), device=device).tolist()]
+    n = _Noise(B, device, seeds)
+    _ACTIVE["noise"] = n
+    return n
+
+
+def _augment(multiplicity, s_trans=1.0, device=None, dtype=torch.float32):
+    n = _ACTIVE.get("noise")
+    if n is None:
+        return _ORIG_AUGMENT(multiplicity, s_trans=s_trans, device=device, dtype=dtype)
+    return n.augment(multiplicity, s_trans, dtype)
+
+
+_ORIG_AUGMENT = None
+
+
 # ---------------------------------------------------------------- sampler ---
 # AtomDiffusion.sample() sizes its steering buffers with `multiplicity`, which
 # is the per-record sample count. The real leading axis is batch * multiplicity
@@ -143,6 +207,10 @@ _SAMPLE_SUBS = [
      "multiplicity=sample_ids_chunk.numel() // _Bsz,"),
     ("energy = torch.zeros(multiplicity, device=self.device)",
      "energy = torch.zeros(_Bsz * multiplicity, device=self.device)"),
+    ("atom_coords = init_sigma * torch.randn(shape, device=self.device)",
+     "atom_coords = init_sigma * (_nz.randn(shape) if _nz is not None else torch.randn(shape, device=self.device))"),
+    ("eps = sqrt(noise_var) * torch.randn(shape, device=self.device)",
+     "eps = sqrt(noise_var) * (_nz.randn(shape) if _nz is not None else torch.randn(shape, device=self.device))"),
 ]
 
 
@@ -159,9 +227,20 @@ def patch_sampler():
     # capture the pre-expansion batch size before atom_mask is repeat_interleave'd
     anchor = "    if steering_args is not None and ("      # dedented to module level
     assert anchor in src, "sample() prologue changed"
-    src = src.replace(anchor, "    _Bsz = atom_mask.shape[0]\n" + anchor, 1)
+    src = src.replace(
+        anchor,
+        "    _Bsz = atom_mask.shape[0]\n    _nz = _POTB_BEGIN(_Bsz, atom_mask.device)\n" + anchor,
+        1)
 
-    ns = dict(D.__dict__)
+    # share the module's LIVE globals, not a copy: a copy freezes the helpers at
+    # patch time and the rewritten body then calls the unoptimised originals.
+    global _ORIG_AUGMENT
+    if _ORIG_AUGMENT is None:
+        _ORIG_AUGMENT = D.compute_random_augmentation
+    D.compute_random_augmentation = _augment     # per-record rotations / translations
+
+    ns = D.__dict__
+    ns["_POTB_BEGIN"] = _begin
     exec(compile(src, "<batched_sample>", "exec"), ns)
-    D.AtomDiffusion.sample = ns["sample"]
+    D.AtomDiffusion.sample = ns.pop("sample")
     return len(_SAMPLE_SUBS)

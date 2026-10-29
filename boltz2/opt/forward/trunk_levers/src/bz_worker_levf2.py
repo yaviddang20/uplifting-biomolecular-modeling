@@ -57,6 +57,13 @@ from boltz.data.types import Manifest
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.models.boltz2 import Boltz2
+BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS") == "1"   # batch-aware steering potentials: lets --use_potentials inputs share a batch
+if BATCH_POT:   # must run BEFORE the kit wraps AtomDiffusion.sample, or the source rewrite sees the wrapper
+    import importlib.util as _ilu
+    _ps = _ilu.spec_from_file_location("_potb", "/kit/boltz2/opt/boltz2_opt/potentials_batch/patch.py")
+    _POTB = _ilu.module_from_spec(_ps); _ps.loader.exec_module(_POTB)
+    _POTB_INFO = {'potentials': _POTB.apply(), 'sampler_subs': _POTB.patch_sampler()}
+    print(f"[boltz2-opt] POTENTIALS-BATCH {_POTB_INFO}", flush=True)
 import warnings; warnings.filterwarnings("ignore", ".*that has Tensor Cores. To properly utilize them.*")
 ev("imports_done", torch=torch.__version__, device=torch.cuda.get_device_name(0))
 # ---- BOLTZ-2 TRUNK levers (inert unless BOLTZ_LEVERS is set; stock bytes otherwise) ----
@@ -105,10 +112,6 @@ def stock_model_kwargs():
 # parsing zygote per input (prep.py) — the process context `boltz predict <one yaml>` parses in: RDKit's conformer RNG is process-global and unseeded upstream,
 # so only a process that has embedded nothing before hands a SMILES ligand the conformer stock hands it ----------------
 from boltz2_opt import prep as _prep, skipped as SK, writer as WR   # prep: the parsing zygote (worker_launch forks it before CUDA / hooks); skipped: inputs the stock parser skips, named on one SKIPPED line; writer: the output writer off the critical path (registry writer_overlap, BOLTZ_WRITER=overlap, attached by worker_launch) — when it is not installed every WR call below is the stock statement it stands beside
-BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS") == "1"   # batch-aware steering potentials: lets --use_potentials inputs share a batch
-if BATCH_POT:
-    from boltz2_opt.potentials_batch import patch as _POTB
-    LOG['env']['potentials_batch'] = {'potentials': _POTB.apply(), 'sampler_subs': _POTB.patch_sampler()}
 PREP = _prep.zygote(); LOG["env"]["prep"] = PREP.describe()
 PROCESS_INPUTS_KW = dict(dict(use_msa_server=False, msa_server_url="https://api.colabfold.com", msa_pairing_strategy="greedy", preprocessing_threads=1, max_msa_seqs=8192), boltz2=True,
                          **{k: OPTS[k] for k in ("use_msa_server", "msa_server_url", "msa_pairing_strategy", "preprocessing_threads", "max_msa_seqs") if k in OPTS})   # main.py predict()'s arguments to process_inputs: the CLI defaults, or the caller's --use_msa_server / --msa_server_url / --msa_pairing_strategy / --preprocessing-threads / --max_msa_seqs
@@ -308,7 +311,7 @@ if args.pipeline and BATCH_N > 1:
         UNITS.append({"name": it["name"], "it": it, "out_dir": out_dir, "processed": processed, "t_proc": t_proc, "manifest": processed.manifest,
                       "targets_dir": processed.targets_dir, "msa_dir": processed.msa_dir, "constraints_dir": processed.constraints_dir,
                       "template_dir": processed.template_dir, "extra_mols_dir": processed.extra_mols_dir, "ntok": BT.n_tokens_hint(rec),
-                      "alone": bool(rec.affinity) or (guided and not BATCH_POT) or SMOD is None})   # upstream's affinity leg and per-step steering / guidance are single-record
+                      "alone": bool(rec.affinity) or (guided and not BATCH_POT) or (SMOD is None and not BATCH_POT)})   # upstream's affinity leg and per-step steering / guidance are single-record
     BID = [0]
     def write_group(pred, singles, recs, idxs, s, t_pred, digs, bid, conf):
         n = len(idxs)
@@ -333,7 +336,9 @@ if args.pipeline and BATCH_N > 1:
     def run_group(batch, singles, idxs, s):
         n = len(idxs); recs = list(batch["record"]); BID[0] += 1; bid = BID[0]
         rng_set(POST_CTOR[s])                                        # every batch starts at the pass's post-construction streams; the sampler's noise is per record (below)
-        if SMOD is not None: SMOD.BATCH["seeds"] = [BT.record_seed(s, UNITS[i]["name"]) for i in idxs]
+        _sd = [BT.record_seed(s, UNITS[i]["name"]) for i in idxs]
+        if SMOD is not None: SMOD.BATCH["seeds"] = _sd
+        if BATCH_POT: _POTB.BATCH["seeds"] = _sd   # per-record noise for the eager steered sampler
         BT.CTX["conf"] = None; err = None; pred = None
         torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize(); t_pred = time.time(); DIGS["last"] = {}
         try:
@@ -349,6 +354,7 @@ if args.pipeline and BATCH_N > 1:
         finally:
             BT.CTX["singles"] = None
             if SMOD is not None: SMOD.BATCH["seeds"] = None
+            if BATCH_POT: _POTB.BATCH["seeds"] = None
         torch.cuda.synchronize(); t_pred = time.time() - t_pred
         if err is not None and n > 1:
             LOG.setdefault("batch_fallbacks", []).append({"batch_id": bid, "n": n, "names": [UNITS[i]["name"] for i in idxs], "seed": s, "reason": err, "utc": utc()})
