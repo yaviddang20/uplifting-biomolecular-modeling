@@ -31,8 +31,9 @@ def _batched_compute_args(cls, orig):
         # parameter values, both constant across a guidance loop, so memoise it;
         # rebuilding per-record topology that often is most of the batched cost.
         try:
-            key = (id(feats), tuple(sorted((k, float(v)) for k, v in parameters.items()
-                                           if isinstance(v, (int, float, bool)))))
+            key = None if _NO_CACHE else (
+                id(feats), tuple(sorted((k, float(v)) for k, v in parameters.items()
+                                        if isinstance(v, (int, float, bool)))))
         except Exception:
             key = None
         hit = getattr(self, "_args_cache", None)
@@ -171,6 +172,18 @@ def _compute_gradient(self, coords, feats, parameters):
         prod, "sum")
 
 
+def deterministic():
+    """Make the guided path bit-reproducible so a cross-record difference means
+    coupling rather than amplified rounding. scatter_reduce(..., "sum") in the
+    guidance loop uses atomics, whose summation order varies run to run; over
+    ~200 steps x 20 guidance steps the sampler amplifies that. Costs speed."""
+    import os
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.benchmark = False
+    return True
+
+
 def apply():
     P.Potential.compute = _compute
     P.Potential.compute_gradient = _compute_gradient
@@ -273,7 +286,10 @@ _ORIG_AUGMENT = None
 # copy, so an upstream change to the body shows up as a failed substitution
 # instead of silently stale code.
 import inspect
+import os
 import textwrap
+
+_NO_CACHE = os.environ.get("POTB_NO_CACHE") == "1"   # measurement switch
 
 _SAMPLE_SUBS = [
     ("energy_traj = torch.empty((multiplicity, 0), device=self.device)",

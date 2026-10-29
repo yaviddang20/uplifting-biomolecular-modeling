@@ -62,6 +62,7 @@ if BATCH_POT:   # must run BEFORE the kit wraps AtomDiffusion.sample, or the sou
     import importlib.util as _ilu
     _ps = _ilu.spec_from_file_location("_potb", "/kit/boltz2/opt/boltz2_opt/potentials_batch/patch.py")
     _POTB = _ilu.module_from_spec(_ps); _ps.loader.exec_module(_POTB)
+    if os.environ.get('POTB_DETERMINISTIC') == '1': _POTB.deterministic()
     _POTB_INFO = {'potentials': _POTB.apply(), 'sampler_subs': _POTB.patch_sampler()}
     print(f"[boltz2-opt] POTENTIALS-BATCH {_POTB_INFO}", flush=True)
 import warnings; warnings.filterwarnings("ignore", ".*that has Tensor Cores. To properly utilize them.*")
