@@ -11,11 +11,19 @@ cd "$root"
 python3 tools/docker2apptainer.py "$kit" >/dev/null     # regenerate so the def matches the Dockerfile
 mkdir -p _jitcache                                     # optional pre-filled compile caches go here (see the kit's STOCK.md)
 # large pulls/builds: keep Apptainer's cache and temp out of a small $HOME / /tmp if the site offers scratch
-export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${SCRATCH:-$HOME}/.apptainer/cache}"
-export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SCRATCH:-${TMPDIR:-/tmp}}/apptainer-tmp-$USER}"
+# Default the caches beside the repo (KIT_BASE: the directory holding the checkout, weights/, kit_out/ -- the same
+# base tools/boltz_compat/boltz resolves), not $HOME. A build unpacks several GB, and a site that does not set
+# SCRATCH leaves $HOME as the fallback, where a home quota of a few GB fails the build partway through.
+base="$(dirname "$root")"
+export APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-${SCRATCH:-$base}/.apptainer/cache}"
+export APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${SCRATCH:-$base}/apptainer-tmp-$USER}"
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 out="${SIF_OUT:-$root/$kit.sif}"
-flags="${APPTAINER_BUILD_FLAGS---fakeroot}"
+# --fakeroot needs subuid/subgid ranges your admins set up; without them apptainer's own unprivileged path
+# builds fine, so do not ask for a flag the host cannot honour. Set APPTAINER_BUILD_FLAGS to override either way.
+if [ -n "${APPTAINER_BUILD_FLAGS+x}" ]; then flags="$APPTAINER_BUILD_FLAGS"
+elif grep -q "^$USER:" /etc/subuid 2>/dev/null; then flags="--fakeroot"
+else flags=""; echo "note: $USER is not in /etc/subuid, building without --fakeroot"; fi
 [ -e "$out" ] && echo "note: $out exists and will be REPLACED (--force)"
 # A PRIVATE /tmp for the build: the kits' Dockerfiles write scratch files under /tmp (e.g. /tmp/pip.txt). Under Docker that is a private
 # /tmp; under Apptainer the HOST /tmp is mounted into %post, so on a shared login node such a path can already exist owned by another user
