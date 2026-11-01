@@ -123,6 +123,22 @@ def _guard(self, feats, parameters):
     raise NotImplementedError(msg)
 
 
+import os as _os_d
+_DUMP = _os_d.environ.get("POTB_DUMP")                  # diagnostic: where b1 and b4 diverge
+_DUMPC = {"noise": 0, "coords": 0}
+
+
+def _dump(tag, arr, limit=4):
+    """Save record 0's slice so a b1 run and a b4 run can be diffed step by step."""
+    if not _DUMP or _DUMPC.get(tag, 0) >= limit:
+        return
+    import numpy as _np
+    _os_d.makedirs(_DUMP, exist_ok=True)
+    _np.save(f"{_DUMP}/{tag}_{_DUMPC[tag]:03d}.npy",
+             arr.detach().float().cpu().numpy())
+    _DUMPC[tag] += 1
+
+
 _orig_compute = P.Potential.compute
 
 def _blockify(coords, B, A):
@@ -190,6 +206,10 @@ _orig_grad = P.Potential.compute_gradient
 def _compute_gradient(self, coords, feats, parameters):
     if _guard(self, feats, parameters):
         return torch.zeros_like(coords)
+    if _DUMP:
+        _B = feats["atom_pad_mask"].shape[0]
+        _dump("coords", coords[: coords.shape[0] // _B,
+                               : int(feats["atom_pad_mask"][0].sum())])
     index, args, com, ref, op = self.compute_args(feats, parameters)
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
@@ -251,20 +271,42 @@ _ACTIVE = {"noise": None}
 
 
 class _Noise:
-    def __init__(self, B, device, seeds):
+    def __init__(self, B, device, seeds, n_real=None):
         self.B, self.device = B, device
-        self.gens = []
+        self.n_real = n_real                    # real atoms per record, or None
+        self.gens, self.pads = [], []
         for b in range(B):
-            g = torch.Generator(device=device)
-            g.manual_seed(int(seeds[b]) % (2 ** 63 - 1))
+            s = int(seeds[b]) % (2 ** 63 - 1)
+            g = torch.Generator(device=device); g.manual_seed(s)
             self.gens.append(g)
+            # A SECOND stream, for the PADDING rows only. The draw for a record's
+            # real atoms must not depend on how wide the batch happens to be
+            # padded, or the record gets different noise depending on its
+            # batch-mates' lengths -- which made a record's structure depend on
+            # the batch size (guided b1 vs b4 was 3.97 A against a 1.0 A gate),
+            # the one thing this carrier exists to prevent.
+            p = torch.Generator(device=device)
+            p.manual_seed((s ^ 0x5DEECE66D) % (2 ** 63 - 1))
+            self.pads.append(p)
 
     def randn(self, shape, dtype=torch.float32):
         m = shape[0] // self.B
         out = torch.empty(shape, device=self.device, dtype=dtype)
-        for b, g in enumerate(self.gens):
-            out[b * m : (b + 1) * m] = torch.randn(
-                (m, *shape[1:]), device=self.device, dtype=dtype, generator=g)
+        A = shape[1] if len(shape) > 2 else None
+        for b in range(self.B):
+            blk = out[b * m : (b + 1) * m]
+            n = None if (A is None or self.n_real is None) else min(int(self.n_real[b]), A)
+            if n is None or n == A:
+                blk[...] = torch.randn(tuple(blk.shape), device=self.device,
+                                       dtype=dtype, generator=self.gens[b])
+                continue
+            blk[:, :n] = torch.randn((m, n, *shape[2:]), device=self.device,
+                                     dtype=dtype, generator=self.gens[b])
+            blk[:, n:] = torch.randn((m, A - n, *shape[2:]), device=self.device,
+                                     dtype=dtype, generator=self.pads[b])
+        if _DUMP:
+            nr = (None if self.n_real is None else int(self.n_real[0]))
+            _dump("noise", out[:m, :nr] if nr else out[:m])
         return out
 
     def augment(self, n, s_trans, dtype):
@@ -279,6 +321,30 @@ class _Noise:
             trs.append(torch.randn((m, 1, 3), dtype=dtype, device=self.device,
                                    generator=g) * s_trans)
         return torch.cat(Rs), torch.cat(trs)
+
+
+def _centre(coords, atom_mask):
+    """Centre of mass over REAL atoms, per row.
+
+    Upstream centres with an UNMASKED mean over every atom slot, so the centre
+    depends on how much padding the batch carries: at B=1 a record's own
+    padding, in a batch the padding out to the widest member. A record therefore
+    gets translated differently depending on its batch-mates' lengths, and from
+    there the trajectories separate -- measured 0.293 A on the coords entering
+    the first guidance call, and 2.9 A on the final structure.
+
+    BATCHING.md records this for the unguided path, where the batched sampler
+    centres over real atoms (training's convention). That lives in the `rollout`
+    lever, which --use_potentials drops by name, so the guided path kept
+    upstream's unmasked mean. This restores the masked convention for it.
+    """
+    m = atom_mask
+    if m.dim() >= 2 and m.shape[0] != coords.shape[0] and m.shape[0] > 0:
+        rep = coords.shape[0] // m.shape[0]
+        if rep > 1:
+            m = m.repeat_interleave(rep, 0)
+    w = m.reshape(coords.shape[0], coords.shape[1], 1).to(coords.dtype)
+    return (coords * w).sum(dim=-2, keepdim=True) / w.sum(dim=-2, keepdim=True).clamp(min=1.0)
 
 
 _DBG = {"n": 0}
@@ -307,7 +373,7 @@ def _mult(Bsz, multiplicity, chunk_n, ids=None, maxpar=None):
     return chunk_n // Bsz
 
 
-def _begin(B, device):
+def _begin(B, device, atom_mask=None):
     """Called at the top of each sample(); None => fall back to stock draws."""
     seeds = BATCH.get("seeds")
     if B == 1 and not seeds:
@@ -315,7 +381,12 @@ def _begin(B, device):
         return None
     if not seeds or len(seeds) != B:
         seeds = [int(x) for x in torch.randint(0, 2 ** 62, (B,), device=device).tolist()]
-    n = _Noise(B, device, seeds)
+    n_real = None
+    if atom_mask is not None and atom_mask.dim() >= 2:
+        # real atoms per record: the width each record's own noise is drawn at,
+        # so the draw is the same whatever the batch pads to.
+        n_real = [int(x) for x in atom_mask.reshape(B, -1).sum(dim=1).tolist()]
+    n = _Noise(B, device, seeds, n_real)
     _ACTIVE["noise"] = n
     return n
 
@@ -374,6 +445,12 @@ _SAMPLE_SUBS = [
      "atom_coords = init_sigma * (_nz.randn(shape) if _nz is not None else torch.randn(shape, device=self.device))"),
     ("eps = sqrt(noise_var) * torch.randn(shape, device=self.device)",
      "eps = sqrt(noise_var) * (_nz.randn(shape) if _nz is not None else torch.randn(shape, device=self.device))"),
+    # Upstream's unmasked centring makes a record's translation depend on the
+    # batch's padding width (see _centre). Both sites must use the masked mean.
+    ("atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)",
+     "atom_coords = atom_coords - _POTB_CENTRE(atom_coords, atom_mask)"),
+    ("atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)",
+     "atom_coords_denoised -= _POTB_CENTRE(atom_coords_denoised, atom_mask)"),
 ]
 
 
@@ -392,7 +469,7 @@ def patch_sampler():
     assert anchor in src, "sample() prologue changed"
     src = src.replace(
         anchor,
-        "    _Bsz = atom_mask.shape[0]\n    _nz = _POTB_BEGIN(_Bsz, atom_mask.device)\n" + anchor,
+        "    _Bsz = atom_mask.shape[0]\n    _nz = _POTB_BEGIN(_Bsz, atom_mask.device, atom_mask)\n" + anchor,
         1)
 
     # share the module's LIVE globals, not a copy: a copy freezes the helpers at
@@ -405,6 +482,7 @@ def patch_sampler():
     ns = D.__dict__
     ns["_POTB_BEGIN"] = _begin
     ns["_POTB_MULT"] = _mult
+    ns["_POTB_CENTRE"] = _centre
     exec(compile(src, "<batched_sample>", "exec"), ns)
     D.AtomDiffusion.sample = ns.pop("sample")
     return len(_SAMPLE_SUBS)
