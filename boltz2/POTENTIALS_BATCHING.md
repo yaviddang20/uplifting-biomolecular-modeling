@@ -4,8 +4,12 @@
 marks every guided record `alone`, so each batch holds one record. This note
 covers the work that lifts that, behind `BOLTZ_BATCH_POTENTIALS=1`.
 
-**Status: off by default.** The potential math is exact, a record is unaffected
-by its batch-mates, and a fixed batch size is exactly reproducible. A record's
+**Status: ON by default** (`BOLTZ_BATCH_POTENTIALS=0` disables it). It does
+nothing unless a run asks for batching, since `BOLTZ_BATCH_SIZE` is 1 when
+unset; at one record per step the patch moves a structure by 0.018 A aligned (a
+0.27 A centring shift, which superposition removes), so a non-batched run is
+unaffected in any way that matters. The potential math is exact, a record is
+unaffected by its batch-mates, and a fixed batch size is exactly reproducible. A record's
 structure does change with the batch size -- a different valid sample of equal
 confidence, from amplified floating-point rounding, and the unguided path has
 the same property to a lesser degree; see *Batch size changes which sample you

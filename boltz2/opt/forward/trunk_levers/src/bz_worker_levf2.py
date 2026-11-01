@@ -57,7 +57,10 @@ from boltz.data.types import Manifest
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.models.boltz2 import Boltz2
-BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS") == "1"   # batch-aware steering potentials: lets --use_potentials inputs share a batch
+BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS", "1") != "0"   # batch-aware steering potentials: lets --use_potentials inputs share a batch
+                                                                   # ON unless set to 0. Harmless without batching: BOLTZ_BATCH_SIZE is 1
+                                                                   # when unset, and at one record per step the patch moves a structure
+                                                                   # 0.018 A (a 0.27 A centring shift, gone after superposition).
 if BATCH_POT:   # must run BEFORE the kit wraps AtomDiffusion.sample, or the source rewrite sees the wrapper
     import importlib.util as _ilu
     _ps = _ilu.spec_from_file_location("_potb", "/kit/boltz2/opt/boltz2_opt/potentials_batch/patch.py")
