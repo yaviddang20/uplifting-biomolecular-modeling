@@ -4,11 +4,12 @@
 marks every guided record `alone`, so each batch holds one record. This note
 covers the work that lifts that, behind `BOLTZ_BATCH_POTENTIALS=1`.
 
-**Status: off by default, and NOT correct across batch sizes.** The potential
-math is exact and a record is unaffected by its batch-mates, but a record's
-structure changes with batch size and fails the 1.0 A gate the unguided path
-passes -- a pre-existing defect, see *Batch size changes a record's structure*.
-Run end to end inside NISE and measured to 256 inputs. Not folded into the
+**Status: off by default.** The potential math is exact, a record is unaffected
+by its batch-mates, and a fixed batch size is exactly reproducible. A record's
+structure does change with the batch size -- a different valid sample of equal
+confidence, from amplified floating-point rounding, and the unguided path has
+the same property to a lesser degree; see *Batch size changes which sample you
+get*. Run end to end inside NISE and measured to 256 inputs. Not folded into the
 image. Untested with affinity on, with MSAs, above ~200 tokens, or on >1 GPU.
 
 Recommended setting: `BOLTZ_BATCH_SIZE=64` (see *Batch size*).
@@ -128,55 +129,88 @@ So: exactly reproducible at fixed shape, and **no coupling between
 batch-mates** -- the probe is unchanged when its companions change, which is the
 property that matters for batching to be sound.
 
-### Batch size changes a record's structure -- UNRESOLVED
+### Batch size changes which sample you get
 
-A record's structure is **not** invariant to batch size, and guided batching
-**fails** the project's own gate for this. Using `BATCHING.md`'s protocol --
-same inputs, `--seed 0`, the batched path on both sides so the per-record noise
-is held fixed, `b1` = every input alone via `BOLTZ_BATCH_MAX_PAD=1.0` -- on the
-confidently predicted Top7 set (pLDDT ~0.85), gate 1.0 A (`run_top7_proper.sh`,
-`cmp_sets.py`):
+A record's structure depends on the batch size. It does **not** depend on which
+records share the batch, and the potential math is exact; what changes is the
+sample you land on.
 
-| comparison | mean | max | |
+First, a distinction that matters more than it sounds. `BOLTZ_BATCH_SIZE=1` is
+not "batching with one record" -- it leaves the batched planner entirely (no
+`BATCH plan` line is printed) and draws a different noise stream, which
+`BATCHING.md` states outright: a batched and a non-batched run of the same input
+at the same `--seed` "differ the way two seeds do". Measured on 8 equal-length
+variants of the Top7 fold, `bs=1` vs `bs=4` is 4.92 A guided and **4.54 A
+unguided** -- the shipped path misses it by just as much. So matching
+`BOLTZ_BATCH_SIZE=1` is not a thing either path does, by design. `BATCHING.md`'s
+harness fakes `b1` with `BOLTZ_BATCH_MAX_PAD=1.0` precisely to stay on the
+batched path.
+
+The answerable question is batch size N against batch size M on the batched
+path. With padding held identical (8 variants of one fold, all 104 residues,
+pLDDT ~0.85, `run_eq2.sh`):
+
+| | `b4` vs `b8` |
+|---|---|
+| guided | 2.02 A |
+| unguided | 0.28 A |
+
+and on mixed lengths with `b1` faked the way their harness does it
+(`run_top7_proper.sh`): guided 2.87 A, unguided 0.21 A, against a 1.0 A gate.
+
+**Why.** Changing the batch size changes tensor shapes, so cuBLAS/Triton tile
+and reduce differently, and float addition is not associative -- the same sum
+computed in a different order differs in the last bits (~1e-7). Diffusion feeds
+each step into the next 200 times, and guidance adds 20 gradient corrections per
+step, so ~4000 feedback applications amplify that where the unguided path's ~200
+do not. The ratio of the two numbers above is that extra amplification.
+`torch.use_deterministic_algorithms(True)` does not help: it makes a *given*
+shape reproducible, which is why a fixed batch size is exact (0.0000 A), not
+different shapes agree.
+
+**Is the quality worse? No, within the power of the test.** Paired
+`complex_plddt` over the same 8 records (`cmp_qual.py`, `qual_stat.py`):
+
+| | b1 -> b4 | b1 -> b8 | b4 -> b8 |
 |---|---|---|---|
-| unguided `b1` vs `b4` | 0.2078 A | 0.4139 A | PASS |
-| unguided `b1` vs `b8` | 0.1880 A | 0.2802 A | PASS |
-| **guided** `b1` vs `b4` | **3.9704 A** | 6.3643 A | **FAIL** |
-| **guided** `b1` vs `b8` | **3.6264 A** | 5.6186 A | **FAIL** |
+| guided | -0.0058 | -0.0117 (t=-3.50) | -0.0059 |
+| unguided | -0.0044 | -0.0065 | -0.0020 |
 
-The unguided rows reproduce `BATCHING.md`'s published 0.21/0.41 and 0.19/0.28,
-so the harness is calibrated against a known-good result.
+At most 0.012 on a 0.85 baseline. One of six comparisons reaches p<0.05, which
+is about what six tests buy you by chance, and it only sits at the boundary once
+corrected. All six deltas are negative, which is itself worth noting (p ~ 0.016
+for 6/6 by sign), so a small systematic cost to larger batches may be real --
+but **unguided drifts the same way at the same magnitude**, so it would belong
+to batching generally, not to guided batching. n=8, one fold, one seed:
+underpowered. Settling it needs 30-50 records over a couple of folds.
 
-**There is no variance to hide behind.** The guided path's own floor is
-0.0000 A: the same configuration run twice is bitwise identical, with forced
-determinism and without it (`run_floor.sh`). The 1.0 A gate therefore applies
-here as much as to the unguided path.
+**Two real bugs were found and fixed here**, both pre-existing (the pre-fix
+implementation is bitwise identical to this one at a matched batch size, raw max
+0.000000 -- `cmp_two.py`), and both invisible until the group-of-one crash
+(054903d) made a `b1` comparison runnable at all:
 
-**This is not caused by the block-diagonal reduction.** At a matched batch size
-the pre-fix masked implementation and this one are bitwise identical -- raw max
-0.000000 over 8 records (`cmp_two.py`, `bench_prefix/out_old_b4` vs
-`bench_top7p/out_g_b4`). The defect predates both of this change's commits and
-lives in the original guided-batching work. It became measurable only now,
-because the pre-fix version *crashed* at `b1` (the group-of-one bug) and so
-could never be compared against it.
+- The per-record noise was drawn at the **padded** atom width, so a record's
+  random stream changed with its batch-mates' lengths. Now drawn at the record's
+  own atom count with padding rows on a separate generator. Verified: record 0's
+  noise is bitwise identical at `b1` and `b4` (`run_diverge.sh`).
+- Centring used upstream's **unmasked** mean over every atom slot, so the
+  molecule was translated by a padding-dependent amount. Now a masked mean over
+  real atoms -- the convention `BATCHING.md` sets for batched samplers, which
+  lives in the `rollout` lever that `--use_potentials` drops by name. It
+  measured ~0 on these near-uniform sets and would matter on uneven batches.
 
-Leading suspect, unverified: the per-record noise carrier draws
-`randn((m, A, 3))` where `A` is the **padded** atom width, which depends on the
-batch's composition -- so one record draws a different stream at a different
-padding. That would also explain why a record is unaffected by batch-mates
-whose lengths leave the padding unchanged (0.000000 A, above) while changing the
-batch size moves it. The unguided sampler does not show the problem.
+Two further hypotheses were tested and rejected: forcing one sampler chunk at
+`B=1` moved the result 0.0014 A (reverted, it overrode a user's
+`max_parallel_samples` for nothing), and the residual is not in the potential
+math, which is bitwise exact per record.
 
-Note what is *not* implicated: energies and gradients are bitwise exact per
-record (see *Unit level*), and at fixed batch size and padding a record is
-unaffected by its batch-mates. The defect is in what the sampler is fed, not in
-the potential math.
-
-**Until this is resolved**, treat guided batching as a throughput optimisation
-whose structures are not interchangeable with `b1`'s, and do not compare a
-batched campaign against an unbatched one structure by structure. The NISE
-quality table below was produced under this defect and should be read as "the
-optimiser still works", not as evidence that batched and unbatched agree.
+**What to rely on.** At a fixed batch size, guided batching is exactly
+reproducible (0.0000 A) and unaffected by batch-mates (0.0000 A), and energies
+and gradients match the per-record call bitwise. Across batch sizes you get a
+different valid sample of equal confidence. Do not diff a batched campaign
+against an unbatched one coordinate by coordinate; compare distributions.
+`POTB_DUMP=<dir>` dumps record 0's noise and the coords entering the guidance
+loop, which is how the two bugs above were localised.
 
 ## Performance
 
@@ -301,9 +335,11 @@ batching at all**. That path is untested.
 - Untested: affinity on, MSAs, >200 tokens, multi-GPU, the OOM fallback path.
 - The three unbatched potentials are skipped, not batched.
 - Determinism was verified at `bs=4`; not re-verified at 64.
-- **The batch-size defect above is open, and blocks using this where structures
-  must match an unbatched run.** The noise-carrier padding hypothesis is
-  untested.
+- Whether the small pLDDT drift with batch size is real is unsettled (~0.01,
+  same direction in the unguided path); 30-50 records over a couple of folds
+  would resolve it.
+- The `POTB_DUMP` instrumentation is diagnostic and stays in; it is env-gated
+  and inert unless set.
 
 ## Files
 
