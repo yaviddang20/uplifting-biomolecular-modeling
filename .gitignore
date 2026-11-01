@@ -5,3 +5,5 @@ build_status*.txt
 _jitcache/
 ._*
 rfdiffusion3/stock/wheels/*.whl
+__pycache__/
+*.pyc
