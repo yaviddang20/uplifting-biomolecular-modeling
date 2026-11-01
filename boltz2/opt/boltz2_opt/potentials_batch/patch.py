@@ -286,6 +286,14 @@ _DBG = {"n": 0}
 
 def _mult(Bsz, multiplicity, chunk_n, ids=None, maxpar=None):
     """Per-record multiplicity for the network, with a one-shot trace."""
+    if Bsz == 1:
+        # One record: upstream's own chunking is already correct and its value is
+        # sample_ids_chunk.numel(), so hand that straight back. The invariant
+        # below is about chunks that would SPLIT a batch across record
+        # boundaries, which cannot happen when there is only one record -- and a
+        # group of one is routine (any record count that is not a multiple of
+        # the batch size leaves a remainder group).
+        return chunk_n
     if chunk_n != Bsz * multiplicity:
         raise RuntimeError(
             f"chunk spans {chunk_n} of {Bsz * multiplicity} rows: a partial chunk "
