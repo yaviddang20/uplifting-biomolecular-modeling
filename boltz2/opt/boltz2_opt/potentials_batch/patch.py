@@ -39,9 +39,11 @@ def _batched_compute_args(cls, orig):
         hit = getattr(self, "_args_cache", None)
         if key is not None and hit is not None and hit[0] == key:
             self._pair_record, self._B = hit[1], B
+            self._A, self._counts = hit[3], hit[4]
             return hit[2]
 
-        idx, argcols, recs = [], [], []
+        A = feats["atom_pad_mask"].shape[1]       # atoms per record (padded)
+        idx, argcols, recs, counts = [], [], [], []
         for b in range(B):
             sub = {k: (v[b : b + 1] if torch.is_tensor(v) else v)
                    for k, v in feats.items()}
@@ -49,20 +51,26 @@ def _batched_compute_args(cls, orig):
             if com is not None or ref is not None or op is not None:
                 raise NotImplementedError(
                     f"{cls.__name__}: com/ref/operator args not batched yet")
-            idx.append(index)
+            # Offset record b's atom indices into ITS OWN block of the flattened
+            # atom axis (see _blockify). Every index row is an atom index whatever
+            # the arity -- 2 for a distance, 4 for a dihedral -- so the shift is
+            # uniform. This is what makes each pair column belong to exactly one
+            # record, which is the whole point.
+            idx.append(index + b * A)
             argcols.append(args)
-            recs.append(torch.full((index.shape[1],), b, dtype=torch.long,
+            counts.append(int(index.shape[-1]))
+            recs.append(torch.full((index.shape[-1],), b, dtype=torch.long,
                                    device=index.device))
 
         self._pair_record = torch.cat(recs)
-        self._B = B
+        self._B, self._A, self._counts = B, A, tuple(counts)
         # args differ in arity and any element may be None (an unbounded side of a
         # flat-bottom potential): concatenate per position, keep None as None.
         cat_args = tuple(None if col[0] is None else torch.cat(col)
                          for col in zip(*argcols))
-        out = (torch.cat(idx, dim=1), cat_args, None, None, None)
+        out = (torch.cat(idx, dim=-1), cat_args, None, None, None)
         if key is not None:
-            self._args_cache = (key, self._pair_record, out)
+            self._args_cache = (key, self._pair_record, out, A, self._counts)
         return out
 
     return compute_args
@@ -117,6 +125,42 @@ def _guard(self, feats, parameters):
 
 _orig_compute = P.Potential.compute
 
+def _blockify(coords, B, A):
+    """(L, A, 3) record-major -> (m, B*A, 3): the records laid side by side on
+    the ATOM axis, samples alone on the leading axis.
+
+    Upstream's compute_variable pairs EVERY leading row with EVERY index column.
+    Concatenating the records along the pair axis therefore costs
+    (B*m, B*p) -- every sample meets every record's pairs -- of which only the B
+    diagonal blocks mean anything, so B-1 blocks out of B are computed and then
+    masked away: the work, and the memory, grow as B**2.
+
+    Putting the records on the atom axis instead (with compute_args offsetting
+    each record's indices into its own block) leaves (m, B*p): every column
+    references exactly one record's atoms, every row is a valid sample for it,
+    and nothing is wasted. Linear in B, and upstream's own kernels run unchanged.
+    """
+    L = coords.shape[0]
+    m = L // B
+    return coords.reshape(B, m, A, 3).permute(1, 0, 2, 3).reshape(m, B * A, 3), m, L
+
+
+def _segsum(energy, counts):
+    """Per-record totals of an (m, P) energy whose columns are grouped by record.
+
+    A contiguous slice per record, summed with torch.sum over exactly that
+    record's own column count, is the same reduction over the same values in the
+    same shape that the unbatched call performs -- so the result matches it
+    bitwise. The alternatives do not: index_add_ is 135x slower here and is
+    wrong run-to-run outside deterministic mode (measured max|d| 5.9e-2), and a
+    padded reshape would sum a different number of columns than upstream does.
+    """
+    o, outs = 0, []
+    for c in counts:
+        outs.append(energy[:, o : o + c].sum(dim=1))
+        o += c
+    return torch.stack(outs, dim=1)                      # (m, B)
+
 
 def _compute(self, coords, feats, parameters):
     if _guard(self, feats, parameters):
@@ -125,18 +169,19 @@ def _compute(self, coords, feats, parameters):
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
         return _orig_compute(self, coords, feats, parameters)
-    if index.shape[1] == 0:
+    if index.shape[-1] == 0:
         return torch.zeros(coords.shape[:-2], device=coords.device)
 
-    value = self.compute_variable(coords, index, ref_coords=None, ref_mask=None,
+    B, A, counts = self._B, self._A, self._counts
+    cf, m, L = _blockify(coords, B, A)
+    value = self.compute_variable(cf, index, ref_coords=None, ref_mask=None,
                                   compute_gradient=False)
     energy = self.compute_function(value, *args, negation_mask=None,
                                    compute_derivative=False)
-    L = energy.shape[0]                      # B * samples_per_record
-    m = L // self._B
-    rec_of = torch.arange(L, device=energy.device) // m
-    mask = pr.unsqueeze(0) == rec_of.unsqueeze(1)      # (L, P)
-    return (energy * mask).sum(dim=tuple(range(1, energy.dim())))
+    if energy.dim() != 2:
+        raise NotImplementedError(
+            f"{type(self).__name__}: energy of rank {energy.dim()} not batched yet")
+    return _segsum(energy, counts).t().reshape(L)        # back to record-major (L,)
 
 
 _orig_grad = P.Potential.compute_gradient
@@ -149,28 +194,27 @@ def _compute_gradient(self, coords, feats, parameters):
     pr = getattr(self, "_pair_record", None)
     if pr is None or com is not None or ref is not None or op is not None:
         return _orig_grad(self, coords, feats, parameters)
-    if index.shape[1] == 0:
+    if index.shape[-1] == 0:
         return torch.zeros_like(coords)
 
-    value, grad_value = self.compute_variable(coords, index, ref_coords=None,
+    B, A = self._B, self._A
+    cf, m, L = _blockify(coords, B, A)
+    value, grad_value = self.compute_variable(cf, index, ref_coords=None,
                                               ref_mask=None, compute_gradient=True)
     energy, dEnergy = self.compute_function(value, *args, negation_mask=None,
                                             compute_derivative=True)
-    L = dEnergy.shape[0]
-    m = L // self._B
-    rec_of = torch.arange(L, device=dEnergy.device) // m
-    dEnergy = dEnergy * (pr.unsqueeze(0) == rec_of.unsqueeze(1))   # foreign pairs contribute nothing
-
     prod = dEnergy.tile(grad_value.shape[-3]).unsqueeze(-1) * grad_value.flatten(
         start_dim=-3, end_dim=-2)
     if prod.dim() > 3:
         prod = prod.sum(dim=list(range(1, prod.dim() - 2)))
-    return torch.zeros_like(coords).scatter_reduce(
+    # No mask: each column's atoms live in its own record's block, so the
+    # scatter already routes every contribution to the right record.
+    g = torch.zeros_like(cf).scatter_reduce(
         -2,
         index.flatten(start_dim=0, end_dim=1).unsqueeze(-1).expand(
-            (*coords.shape[:-2], -1, 3)),
+            (*cf.shape[:-2], -1, 3)),
         prod, "sum")
-
+    return g.reshape(m, B, A, 3).permute(1, 0, 2, 3).reshape(coords.shape)
 
 def deterministic():
     """Make the guided path bit-reproducible so a cross-record difference means
