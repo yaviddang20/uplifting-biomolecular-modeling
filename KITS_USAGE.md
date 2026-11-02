@@ -206,12 +206,44 @@ and point to them (`msa: /path/x.a3m` in YAML; paste into `unpairedMsa` in AF3 J
 Every run prints `ACTIVE mode=...`. `NOT ACTIVE: <reason>` + exit code 3 means it refused to run and tells you why.
 The first run of each mode compiles kernels (~1 min); later runs reuse `kit_out/<kit>/jit/`.
 
-## Batched Boltz-2 (experimental, branch `boltz2-batching`)
+## Batched Boltz-2 (experimental)
 
-Several different inputs per GPU step on `--mode fast` (`BOLTZ_BATCH_SIZE=N`): roughly 1.2-2.5x throughput on 100-200-residue inputs
-in the tests so far, matching non-batched structures to ~0.2 A on a confident protein. Not in the `main` images and not yet tested with
-MSAs. Usage, validation numbers and limits: `boltz2/BATCHING.md` on that branch
-(https://github.com/yaviddang20/uplifting-biomolecular-modeling/blob/boltz2-batching/boltz2/BATCHING.md).
+Several different inputs per GPU step on `--mode fast`. In the `main` images since the merge -- no branch, no code overlay, one variable:
+
+```bash
+export BOLTZ_BATCH_SIZE=64
+boltz2_kit pred --config h100 --mode fast --input <dir of yamls> --out_dir out/x
+```
+
+Use **64**: within 2.7% of the fastest measured point at half the memory, and it leaves headroom for targets larger than the
+110-token ones that were benchmarked (pair memory grows roughly with the square of the atom count). Measured on one H200, 110-token
+inputs, guided:
+
+| batch | sampler s/record | peak GiB |
+|---|---|---|
+| 16 | 1.975 | 4.84 |
+| 64 | 1.460 | 12.97 |
+| 128 | 1.421 | 23.77 |
+| 256 | 1.432 | 45.37 |
+
+Below 64 the GPU is occupancy-limited and adding records fills idle hardware; at and above 64 it is saturated, so the curve
+plateaus -- that is the ceiling of what batching can buy. Memory is linear (`2.16 + 0.169*B` GiB). A batch group is capped by the
+records actually handed to one `boltz predict` call, so `bs=64` buys nothing when a call has fewer than 64 records.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOLTZ_BATCH_SIZE` | `1` | maximum inputs per predict step. Unset or `1` runs upstream's one-input-per-step loop, unchanged |
+| `BOLTZ_BATCH_MAX_PAD` | `1.25` | longest / shortest token count allowed in one batch, so a batch can hold fewer than `BOLTZ_BATCH_SIZE` |
+| `BOLTZ_BATCH_POTENTIALS` | `1` (on) | batch `--use_potentials` runs too. `0` backs out to one record at a time if you suspect it |
+
+**What is validated:** unguided matches non-batched to ~0.2-0.4 A on a confident protein; guided is bitwise identical across
+different batch-mates at a fixed batch size. **Batch size changes which sample you get** -- `b4` vs `b8` moves a guided structure
+2.02 A (unguided: 0.28 A), because the reduction order over a different tensor shape differs and the guidance loop amplifies it over
+~4,000 applications. Quality does not measurably suffer (paired `complex_plddt` moves <=0.012 on a 0.85 baseline), but a run is only
+reproducible at a fixed `BOLTZ_BATCH_SIZE`. **Not tested:** MSAs, ligands, templates, `--diffusion_samples > 1`, targets over
+200 tokens, multi-GPU, the OOM fallback. Affinity (`pbind`) objectives opt out on their own and get no speedup.
+
+Details, validation protocol and limits: `boltz2/BATCHING.md` (unguided) and `boltz2/POTENTIALS_BATCHING.md` (guided).
 
 ## Full docs
 

@@ -24,8 +24,9 @@ measured over 9 of them the marginal cost is ~1 MiB of private memory each (1262
 reports for the shared set). Details and the 2x2 against GPU batching:
 [boltz2/BATCHING.md](boltz2/BATCHING.md).
 
-Branch `boltz2-batching` (experimental): batched Boltz-2 inference, several inputs per GPU step on `--mode fast` — see
-[boltz2/BATCHING.md](boltz2/BATCHING.md). It modifies kit files under `boltz2/opt/` (listed there); `main` leaves every kit's code as released.
+Batched Boltz-2 inference (experimental, on `main`): several inputs per GPU step on `--mode fast`, `BOLTZ_BATCH_SIZE=N` — see
+[boltz2/BATCHING.md](boltz2/BATCHING.md) and, for `--use_potentials` runs (batched by default), [boltz2/POTENTIALS_BATCHING.md](boltz2/POTENTIALS_BATCHING.md).
+It modifies kit files under `boltz2/opt/` (listed there); this is the one place the fork departs from leaving every kit's code as released.
 
 Built and `check`ed on an H100 NVL with Apptainer 1.5.2: boltz2, af3_torch, boltzgen, complexa, rfdiffusion3 (and proteinmpnn built).
 Start with `tools/README.md`.

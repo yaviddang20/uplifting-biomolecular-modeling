@@ -25,7 +25,8 @@ BOLTZ_BATCH_SIZE=4 bash run.sh pred --config h100 --mode fast --input <dir of ya
 A batched run prints `[boltz2-opt] BATCH batch_size=… max_pad=…`, then a `BATCH plan:` line in the worker log
 (`<out_dir>/pred_worker.log`) with the batch sizes, and `item_done … batch=<id> batch_n=<n>` per input.
 
-From an image built from `main` (no batching code inside), overlay this branch's kit code at run time; no rebuild is needed:
+The batching code is inside the `main` image, so nothing extra is needed. To run a *newer* checkout's kit code against an
+older image without rebuilding, overlay it at run time (this is what `BOLTZ_KIT_CODE` does for the wrapper):
 
 ```bash
 BOLTZ_BATCH_SIZE=4 BOLTZ_CACHE=/weights/boltz2 apptainer run --nv \
