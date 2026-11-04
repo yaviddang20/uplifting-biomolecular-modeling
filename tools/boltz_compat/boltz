@@ -9,8 +9,8 @@ and change nothing else:
     CUDA_VISIBLE_DEVICES (else 0..N-1)
   * writes upstream's layout: X/boltz_results_<input stem>/predictions/<name>/<name>_model_0.<pdb|cif>, confidence_*.json, plddt_*.npz,
     pae_*/pde_*.npz, affinity_<name>.json — the files themselves are written by upstream's own writer inside the kit, unchanged
-  * BOLTZ_BATCH_SIZE / BOLTZ_BATCH_MAX_PAD in the environment pass through (batched inference needs the boltz2-batching branch's kit code:
-    BOLTZ_KIT_CODE)
+  * BOLTZ_BATCH_SIZE / BOLTZ_BATCH_MAX_PAD in the environment pass through; the batching code is in the image, so nothing else is needed.
+    Only an image built before it was merged needs a newer checkout's kit code bound over it (BOLTZ_KIT_CODE)
 
 Settings (environment):
   KIT_BASE           directory holding uplifting-biomolecular-modeling/, weights/, kit_out/  (default: two levels above this script's repo)
@@ -18,7 +18,7 @@ Settings (environment):
   BOLTZ_KIT_WEIGHTS  the Boltz-2 cache on the host          (default: --cache if given, else $KIT_BASE/weights/boltz2)
   BOLTZ_KIT_MODE     kit mode: fast (default) | exact | off  (`--no_kernels` or `--model boltz1` force `off`: plain upstream boltz in the image)
   BOLTZ_KIT_CONFIG   h100 | h200 | a100                     (default: from the GPU's name)
-  BOLTZ_KIT_CODE     a checkout whose boltz2/ and common/ are bound over the image's kit code (e.g. the boltz2-batching branch); unset = the image's
+  BOLTZ_KIT_CODE     a checkout whose boltz2/ and common/ are bound over the image's kit code (e.g. a checkout newer than the image); unset = the image's
   BOLTZ_KIT_PROCS    concurrent kit processes PER GPU (default 1). Each one predicts ONE record per step, so every result is
                      bit-identical to a plain unbatched run, while the GPU overlaps their work — the throughput of batching
                      WITHOUT changing any number. Use this, not BOLTZ_BATCH_SIZE, when outputs must match unbatched runs.
