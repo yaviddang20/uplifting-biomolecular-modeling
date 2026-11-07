@@ -4,7 +4,10 @@
 marks every guided record `alone`, so each batch holds one record. This note
 covers the work that lifts that, behind `BOLTZ_BATCH_POTENTIALS=1`.
 
-**Status: ON by default** (`BOLTZ_BATCH_POTENTIALS=0` disables it). It does
+**Status: opt-in** (`BOLTZ_BATCH_POTENTIALS=1` enables it). It was briefly on by
+default; that broke every non-guided run, because the sampler levers own
+`AtomDiffusion.sample` on those routes and the source rewrite then matches
+nothing. A failed rewrite now costs the speedup, not the run. It does
 nothing unless a run asks for batching, since `BOLTZ_BATCH_SIZE` is 1 when
 unset; at one record per step the patch moves a structure by 0.018 A aligned (a
 0.27 A centring shift, which superposition removes), so a non-batched run is

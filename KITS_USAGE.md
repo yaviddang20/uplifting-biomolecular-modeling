@@ -234,7 +234,7 @@ records actually handed to one `boltz predict` call, so `bs=64` buys nothing whe
 |---|---|---|
 | `BOLTZ_BATCH_SIZE` | `1` | maximum inputs per predict step. Unset or `1` runs upstream's one-input-per-step loop, unchanged |
 | `BOLTZ_BATCH_MAX_PAD` | `1.25` | longest / shortest token count allowed in one batch, so a batch can hold fewer than `BOLTZ_BATCH_SIZE` |
-| `BOLTZ_BATCH_POTENTIALS` | `1` (on) | batch `--use_potentials` runs too. `0` backs out to one record at a time if you suspect it |
+| `BOLTZ_BATCH_POTENTIALS` | unset (off) | `1` also batches `--use_potentials` runs. Opt-in: it rewrites the sampler's source, which only applies on the guided route. Leave it unset for ordinary `fast` batching |
 
 **What is validated:** unguided matches non-batched to ~0.2-0.4 A on a confident protein; guided is bitwise identical across
 different batch-mates at a fixed batch size. **Batch size changes which sample you get** -- `b4` vs `b8` moves a guided structure

@@ -57,17 +57,28 @@ from boltz.data.types import Manifest
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.write.writer import BoltzWriter
 from boltz.model.models.boltz2 import Boltz2
-BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS", "1") != "0"   # batch-aware steering potentials: lets --use_potentials inputs share a batch
-                                                                   # ON unless set to 0. Harmless without batching: BOLTZ_BATCH_SIZE is 1
-                                                                   # when unset, and at one record per step the patch moves a structure
-                                                                   # 0.018 A (a 0.27 A centring shift, gone after superposition).
-if BATCH_POT:   # must run BEFORE the kit wraps AtomDiffusion.sample, or the source rewrite sees the wrapper
+BATCH_POT = os.environ.get("BOLTZ_BATCH_POTENTIALS") == "1"        # batch-aware steering potentials: lets --use_potentials inputs share a batch.
+                                                                   # OPT-IN. It was briefly on by default on the premise that it is harmless
+                                                                   # without batching; it is not. patch_sampler() rewrites the SOURCE of
+                                                                   # AtomDiffusion.sample, but on every route that keeps the sampler levers
+                                                                   # (i.e. anything that is not --use_potentials, where RUN_DROPS drops
+                                                                   # rollout / graph_sampler / dit_hoist) the roll-out already owns
+                                                                   # AtomDiffusion.sample by the time this runs -- worker_launch --attach
+                                                                   # applies it before this script executes -- so inspect.getsource returns
+                                                                   # the lever's wrapper, no anchor matches, and the worker died at import
+                                                                   # for EVERY non-guided input. Opt in only for a guided campaign.
+if BATCH_POT:
     import importlib.util as _ilu
-    _ps = _ilu.spec_from_file_location("_potb", "/kit/boltz2/opt/boltz2_opt/potentials_batch/patch.py")
-    _POTB = _ilu.module_from_spec(_ps); _ps.loader.exec_module(_POTB)
-    if os.environ.get('POTB_DETERMINISTIC') == '1': _POTB.deterministic()
-    _POTB_INFO = {'potentials': _POTB.apply(), 'sampler_subs': _POTB.patch_sampler()}
-    print(f"[boltz2-opt] POTENTIALS-BATCH {_POTB_INFO}", flush=True)
+    try:
+        _ps = _ilu.spec_from_file_location("_potb", "/kit/boltz2/opt/boltz2_opt/potentials_batch/patch.py")
+        _POTB = _ilu.module_from_spec(_ps); _ps.loader.exec_module(_POTB)
+        if os.environ.get('POTB_DETERMINISTIC') == '1': _POTB.deterministic()
+        _POTB_INFO = {'potentials': _POTB.apply(), 'sampler_subs': _POTB.patch_sampler()}
+        print(f"[boltz2-opt] POTENTIALS-BATCH {_POTB_INFO}", flush=True)
+    except Exception as _e:   # a source rewrite that does not apply must cost the SPEEDUP, not the run: guided
+        BATCH_POT = False     # records fall back to alone=1 below (correct, one record per step), everything else is untouched
+        print(f"[boltz2-opt] POTENTIALS-BATCH unavailable, guided records run one per step: "
+              f"{type(_e).__name__}: {_e}", flush=True)
 import warnings; warnings.filterwarnings("ignore", ".*that has Tensor Cores. To properly utilize them.*")
 # ---- parallel input parsing (BOLTZ_PARSE_PROCS=N, N>1) ------------------------------------------------------------------------------
 # Input parsing (check_inputs + process_inputs, incl. RDKit conformer generation) is otherwise fully serial, overlapping nothing.
